@@ -1,0 +1,80 @@
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "mjviser"
+version = "0.0.1"
+license = "Apache-2.0"
+readme = "README.md"
+authors = [
+  {name = "The MjLab Developers"},
+]
+keywords = ["mujoco", "viser", "visualization", "robotics", "simulation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+  "Typing :: Typed",
+  "Topic :: Scientific/Engineering :: Visualization",
+]
+description = "Web-based MuJoCo viewer powered by viser."
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "mujoco>=3.6.0",
+  "numpy",
+  "trimesh>=4.8.3",
+  "viser>=1.0.24",
+  "Pillow",
+]
+
+[project.scripts]
+mjviser = "mjviser.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[dependency-groups]
+dev = [
+    "mujoco-warp",
+    "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "ruff>=0.15.7",
+]
+
+[tool.ruff]
+line-length = 88
+src = ["src"]
+indent-width = 2
+exclude = [
+  "typings",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+ignore = ["B011"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+ignore = ["./typings", "./examples"]
+stubPath = "typings"
+
+[tool.ty.environment]
+extra-paths = ["typings"]
+
+[tool.ty.src]
+include = ["src"]
+exclude = ["typings"]
+
+[tool.uv.sources]
+mujoco-warp = { path = "../mujoco_warp", editable = true }
