@@ -120,12 +120,12 @@ def _cubemap_vertex_colors(
   dots = normals @ axes.T
   ranked = np.argsort(-dots, axis=1)
   nf = len(faces)
-  tri_colors = np.zeros((nf, 4), dtype=np.uint8)
-  for fi in range(nf):
-    for ci in ranked[fi]:
-      if has_color[ci]:
-        tri_colors[fi] = face_colors[ci]
-        break
+  valid = has_color[ranked]  # (nf, 6) bool
+  first_valid = valid.argmax(axis=1)  # First True per row.
+  best_face = ranked[np.arange(nf), first_valid]
+  tri_colors = face_colors[best_face]
+  # Zero out rows where no face has color.
+  tri_colors[~valid.any(axis=1)] = 0
 
   # Duplicate vertices so each triangle gets its own color.
   new_verts = vertices[faces.ravel()]
@@ -174,9 +174,7 @@ def _extract_mesh_data(
   return new_verts, new_faces, new_uvs
 
 
-def mujoco_mesh_to_trimesh(
-  mj_model: mujoco.MjModel, geom_idx: int, verbose: bool = False
-) -> trimesh.Trimesh:
+def mujoco_mesh_to_trimesh(mj_model: mujoco.MjModel, geom_idx: int) -> trimesh.Trimesh:
   """Convert a MuJoCo mesh geometry to a trimesh with visual appearance.
 
   Color resolution order:
@@ -220,37 +218,43 @@ def mujoco_mesh_to_trimesh(
   return mesh
 
 
+def _create_shape_mesh(geom_type: int, size: np.ndarray) -> trimesh.Trimesh:
+  """Create an uncolored mesh for a standard shape type."""
+  if geom_type == mjtGeom.mjGEOM_SPHERE:
+    return trimesh.creation.icosphere(radius=size[0], subdivisions=2)
+  elif geom_type == mjtGeom.mjGEOM_BOX:
+    return trimesh.creation.box(extents=2.0 * size)
+  elif geom_type == mjtGeom.mjGEOM_CAPSULE:
+    return trimesh.creation.capsule(radius=size[0], height=2.0 * size[1])
+  elif geom_type == mjtGeom.mjGEOM_CYLINDER:
+    return trimesh.creation.cylinder(radius=size[0], height=2.0 * size[1])
+  elif geom_type == mjtGeom.mjGEOM_ELLIPSOID:
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    mesh.apply_scale(size)
+    return mesh
+  raise ValueError(f"Unsupported shape type: {geom_type}")
+
+
 def create_primitive_mesh(mj_model: mujoco.MjModel, geom_id: int) -> trimesh.Trimesh:
   """Create a mesh for primitive geom types.
 
   Supports sphere, box, capsule, cylinder, plane, ellipsoid, and
   heightfield.
   """
-  size = mj_model.geom_size[geom_id]
   geom_type = mj_model.geom_type[geom_id]
-  rgba_uint8 = _resolve_flat_rgba(mj_model, geom_id)
 
-  if geom_type == mjtGeom.mjGEOM_SPHERE:
-    mesh = trimesh.creation.icosphere(radius=size[0], subdivisions=2)
-  elif geom_type == mjtGeom.mjGEOM_BOX:
-    mesh = trimesh.creation.box(extents=2.0 * size)
-  elif geom_type == mjtGeom.mjGEOM_CAPSULE:
-    mesh = trimesh.creation.capsule(radius=size[0], height=2.0 * size[1])
-  elif geom_type == mjtGeom.mjGEOM_CYLINDER:
-    mesh = trimesh.creation.cylinder(radius=size[0], height=2.0 * size[1])
-  elif geom_type == mjtGeom.mjGEOM_PLANE:
+  if geom_type == mjtGeom.mjGEOM_HFIELD:
+    return _create_heightfield_mesh(mj_model, geom_id)
+
+  if geom_type == mjtGeom.mjGEOM_PLANE:
+    size = mj_model.geom_size[geom_id]
     plane_x = 2.0 * size[0] if size[0] > 0 else 20.0
     plane_y = 2.0 * size[1] if size[1] > 0 else 20.0
     mesh = trimesh.creation.box((plane_x, plane_y, 0.001))
-  elif geom_type == mjtGeom.mjGEOM_ELLIPSOID:
-    mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
-    mesh.apply_scale(size)
-  elif geom_type == mjtGeom.mjGEOM_HFIELD:
-    return _create_heightfield_mesh(mj_model, geom_id)
   else:
-    raise ValueError(f"Unsupported primitive geom type: {geom_type}")
+    mesh = _create_shape_mesh(geom_type, mj_model.geom_size[geom_id])
 
-  _apply_flat_color(mesh, rgba_uint8)
+  _apply_flat_color(mesh, _resolve_flat_rgba(mj_model, geom_id))
   return mesh
 
 
@@ -273,16 +277,11 @@ def _create_heightfield_mesh(mj_model: mujoco.MjModel, geom_id: int) -> trimesh.
 
   vertices = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
 
-  face_list = []
-  for r in range(nrow - 1):
-    for c in range(ncol - 1):
-      i0 = r * ncol + c
-      i1 = i0 + 1
-      i2 = i0 + ncol
-      i3 = i2 + 1
-      face_list.append([i0, i1, i3])
-      face_list.append([i0, i3, i2])
-  faces = np.array(face_list, dtype=np.int64)
+  ri, ci = np.mgrid[: nrow - 1, : ncol - 1]
+  i0 = (ri * ncol + ci).ravel()
+  faces = np.column_stack(
+    [i0, i0 + 1, i0 + ncol + 1, i0, i0 + ncol + 1, i0 + ncol]
+  ).reshape(-1, 3)
   mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
   # Color by height using HSV.
@@ -383,46 +382,37 @@ def group_geoms_by_visual_compat(
 # ------------------------------------------------------------------
 
 
-def merge_geoms(mj_model: mujoco.MjModel, geom_ids: list[int]) -> trimesh.Trimesh:
-  """Merge multiple geoms into a single trimesh in local body space."""
-  meshes = []
-  for geom_id in geom_ids:
-    if mj_model.geom_type[geom_id] == mjtGeom.mjGEOM_MESH:
-      mesh = mujoco_mesh_to_trimesh(mj_model, geom_id)
-    else:
-      mesh = create_primitive_mesh(mj_model, geom_id)
-
+def _merge_meshes(
+  meshes: list[trimesh.Trimesh],
+  positions: list[np.ndarray],
+  quats: list[np.ndarray],
+) -> trimesh.Trimesh:
+  """Transform and merge meshes given positions and wxyz quaternions."""
+  for mesh, pos, quat in zip(meshes, positions, quats, strict=True):
     transform = np.eye(4)
-    transform[:3, :3] = vtf.SO3(mj_model.geom_quat[geom_id]).as_matrix()
-    transform[:3, 3] = mj_model.geom_pos[geom_id]
+    transform[:3, :3] = vtf.SO3(quat).as_matrix()
+    transform[:3, 3] = pos
     mesh.apply_transform(transform)
-    meshes.append(mesh)
 
   if len(meshes) == 1:
     return meshes[0]
   return trimesh.util.concatenate(meshes)
 
 
-def rotation_quat_from_vectors(from_vec: np.ndarray, to_vec: np.ndarray) -> np.ndarray:
-  """Quaternion (wxyz) that rotates from_vec to to_vec."""
-  from_vec = from_vec / np.linalg.norm(from_vec)
-  to_vec = to_vec / np.linalg.norm(to_vec)
+def merge_geoms(mj_model: mujoco.MjModel, geom_ids: list[int]) -> trimesh.Trimesh:
+  """Merge multiple geoms into a single trimesh in local body space."""
+  meshes = []
+  for geom_id in geom_ids:
+    if mj_model.geom_type[geom_id] == mjtGeom.mjGEOM_MESH:
+      meshes.append(mujoco_mesh_to_trimesh(mj_model, geom_id))
+    else:
+      meshes.append(create_primitive_mesh(mj_model, geom_id))
 
-  if np.allclose(from_vec, to_vec):
-    return np.array([1.0, 0.0, 0.0, 0.0])
-
-  if np.allclose(from_vec, -to_vec):
-    perp = np.array([1.0, 0.0, 0.0])
-    if abs(from_vec[0]) > 0.9:
-      perp = np.array([0.0, 1.0, 0.0])
-    axis = np.cross(from_vec, perp)
-    axis = axis / np.linalg.norm(axis)
-    return np.array([0.0, axis[0], axis[1], axis[2]])
-
-  cross = np.cross(from_vec, to_vec)
-  dot = np.dot(from_vec, to_vec)
-  quat = np.array([1.0 + dot, cross[0], cross[1], cross[2]])
-  return quat / np.linalg.norm(quat)
+  return _merge_meshes(
+    meshes,
+    [mj_model.geom_pos[gid] for gid in geom_ids],
+    [mj_model.geom_quat[gid] for gid in geom_ids],
+  )
 
 
 def rotation_matrix_from_vectors(
@@ -459,76 +449,26 @@ def get_body_name(mj_model: mujoco.MjModel, body_id: int) -> str:
 
 def create_site_mesh(mj_model: mujoco.MjModel, site_id: int) -> trimesh.Trimesh:
   """Create a mesh for a single site."""
-  size = mj_model.site_size[site_id]
-  site_type = mj_model.site_type[site_id]
   rgba = mj_model.site_rgba[site_id].copy()
-
   if np.all(rgba == 0):
     rgba = np.array([0.5, 0.5, 0.5, 1.0])
-
   rgba_uint8 = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
 
-  if site_type == mjtGeom.mjGEOM_SPHERE:
-    mesh = trimesh.creation.icosphere(radius=size[0], subdivisions=2)
-  elif site_type == mjtGeom.mjGEOM_BOX:
-    mesh = trimesh.creation.box(extents=2.0 * size)
-  elif site_type == mjtGeom.mjGEOM_CAPSULE:
-    mesh = trimesh.creation.capsule(radius=size[0], height=2.0 * size[1])
-  elif site_type == mjtGeom.mjGEOM_CYLINDER:
-    mesh = trimesh.creation.cylinder(radius=size[0], height=2.0 * size[1])
-  elif site_type == mjtGeom.mjGEOM_ELLIPSOID:
-    mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
-    mesh.apply_scale(size)
-  else:
-    raise ValueError(f"Unsupported site type: {site_type}")
-
+  mesh = _create_shape_mesh(mj_model.site_type[site_id], mj_model.site_size[site_id])
   _apply_flat_color(mesh, rgba_uint8)
   return mesh
 
 
 def merge_sites(mj_model: mujoco.MjModel, site_ids: list[int]) -> trimesh.Trimesh:
   """Merge multiple sites into a single trimesh in local body space."""
-  meshes = []
-  for site_id in site_ids:
-    mesh = create_site_mesh(mj_model, site_id)
-    transform = np.eye(4)
-    transform[:3, :3] = vtf.SO3(mj_model.site_quat[site_id]).as_matrix()
-    transform[:3, 3] = mj_model.site_pos[site_id]
-    mesh.apply_transform(transform)
-    meshes.append(mesh)
-
-  if len(meshes) == 1:
-    return meshes[0]
-  return trimesh.util.concatenate(meshes)
+  return _merge_meshes(
+    [create_site_mesh(mj_model, sid) for sid in site_ids],
+    [mj_model.site_pos[sid] for sid in site_ids],
+    [mj_model.site_quat[sid] for sid in site_ids],
+  )
 
 
 def get_site_name(mj_model: mujoco.MjModel, site_id: int) -> str:
   """Site name with fallback to ``site_{id}``."""
   name = mj_id2name(mj_model, mjtObj.mjOBJ_SITE, site_id)
   return name if name else f"site_{site_id}"
-
-
-def merge_geoms_global(
-  mj_model: mujoco.MjModel,
-  mj_data: mujoco.MjData,
-  geom_ids: list[int],
-) -> trimesh.Trimesh:
-  """Merge multiple geoms in world space using mj_data transforms."""
-  meshes = []
-  for geom_id in geom_ids:
-    if mj_model.geom_type[geom_id] == mjtGeom.mjGEOM_MESH:
-      mesh = mujoco_mesh_to_trimesh(mj_model, geom_id)
-    else:
-      mesh = create_primitive_mesh(mj_model, geom_id)
-
-    transform = np.eye(4)
-    transform[:3, :3] = mj_data.geom_xmat[geom_id].reshape(3, 3)
-    transform[:3, 3] = mj_data.geom_xpos[geom_id]
-    mesh.apply_transform(transform)
-    meshes.append(mesh)
-
-  if not meshes:
-    return trimesh.Trimesh()
-  if len(meshes) == 1:
-    return meshes[0]
-  return trimesh.util.concatenate(meshes)

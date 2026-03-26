@@ -45,7 +45,7 @@ Use `ViserMujocoScene` directly if you want full control over the loop. The `ser
 
 ```python
 server = viser.ViserServer()
-scene = ViserMujocoScene.create(server, model, num_envs=1)
+scene = ViserMujocoScene(server, model, num_envs=1)
 scene.create_visualization_gui()
 
 while True:

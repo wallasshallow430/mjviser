@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import mujoco
 import numpy as np
+import trimesh
 import viser
 import viser.transforms as vtf
 from mujoco import mj_id2name, mjtGeom, mjtObj
@@ -28,39 +27,24 @@ _DEFAULT_CONTACT_POINT_COLOR = (230, 153, 51)
 _DEFAULT_CONTACT_FORCE_COLOR = (255, 0, 0)
 
 
-@dataclass
 class _Contact:
   """Contact data from MuJoCo."""
 
-  pos: np.ndarray
-  frame: np.ndarray  # 3x3 rotation matrix.
-  force: np.ndarray  # Force in contact frame.
-  dist: float
-  included: bool
+  __slots__ = ("pos", "frame", "force", "included")
+
+  def __init__(
+    self,
+    pos: np.ndarray,
+    frame: np.ndarray,
+    force: np.ndarray,
+    included: bool,
+  ) -> None:
+    self.pos = pos
+    self.frame = frame
+    self.force = force
+    self.included = included
 
 
-@dataclass
-class _ContactPointVisual:
-  """Visual representation data for a contact point."""
-
-  position: np.ndarray
-  orientation: np.ndarray  # Quaternion (wxyz).
-  scale: np.ndarray  # [width, width, height].
-
-
-@dataclass
-class _ContactForceVisual:
-  """Visual representation data for a contact force arrow."""
-
-  shaft_position: np.ndarray
-  shaft_orientation: np.ndarray  # Quaternion (wxyz).
-  shaft_scale: np.ndarray  # [width, width, length].
-  head_position: np.ndarray
-  head_orientation: np.ndarray  # Quaternion (wxyz).
-  head_scale: np.ndarray  # [width, width, width].
-
-
-@dataclass
 class ViserMujocoScene:
   """Manages Viser scene handles and visualization state for MuJoCo models.
 
@@ -70,57 +54,70 @@ class ViserMujocoScene:
   attribute and viser's native API.
   """
 
-  # Core.
-  server: viser.ViserServer
-  mj_model: mujoco.MjModel
-  mj_data: mujoco.MjData
-  num_envs: int
+  def __init__(
+    self,
+    server: viser.ViserServer,
+    mj_model: mujoco.MjModel,
+    num_envs: int,
+  ) -> None:
+    """Create and populate a scene with geometry.
 
-  # Handles (created once).
-  fixed_bodies_frame: viser.SceneNodeHandle = field(init=False)
-  mesh_handles_by_group: dict[tuple[int, int, int], viser.BatchedGlbHandle] = field(
-    default_factory=dict
-  )
-  site_handles_by_group: dict[tuple[int, int], viser.BatchedGlbHandle] = field(
-    default_factory=dict
-  )
-  contact_point_handle: viser.BatchedMeshHandle | None = None
-  contact_force_shaft_handle: viser.BatchedMeshHandle | None = None
-  contact_force_head_handle: viser.BatchedMeshHandle | None = None
+    Args:
+        server: Viser server instance.
+        mj_model: MuJoCo model.
+        num_envs: Number of parallel environments.
+    """
+    self.server = server
+    self.mj_model = mj_model
+    self.mj_data = mujoco.MjData(mj_model)
+    self.num_envs = num_envs
 
-  # Visualization settings.
-  env_idx: int = 0
-  camera_tracking_enabled: bool = True
-  show_only_selected: bool = False
-  geom_groups_visible: list[bool] = field(
-    default_factory=lambda: [True, True, True, False, False, False]
-  )
-  site_groups_visible: list[bool] = field(
-    default_factory=lambda: [True, True, True, False, False, False]
-  )
-  show_contact_points: bool = False
-  show_contact_forces: bool = False
-  contact_point_color: tuple[int, int, int] = _DEFAULT_CONTACT_POINT_COLOR
-  contact_force_color: tuple[int, int, int] = _DEFAULT_CONTACT_FORCE_COLOR
-  meansize_override: float | None = None
-  needs_update: bool = False
-  paused: bool = False
-  _tracked_body_id: int | None = field(init=False, default=None)
+    # Handles.
+    self.mesh_handles_by_group: dict[tuple[int, int, int], viser.BatchedGlbHandle] = {}
+    self.site_handles_by_group: dict[tuple[int, int], viser.BatchedGlbHandle] = {}
+    self.contact_point_handle: viser.BatchedMeshHandle | None = None
+    self.contact_force_shaft_handle: viser.BatchedMeshHandle | None = None
+    self.contact_force_head_handle: viser.BatchedMeshHandle | None = None
+    self._fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = {}
 
-  # Cached visualization state for re-rendering when settings change.
-  _last_body_xpos: np.ndarray | None = None
-  _last_body_xmat: np.ndarray | None = None
-  _last_mocap_pos: np.ndarray | None = None
-  _last_mocap_quat: np.ndarray | None = None
-  _last_env_idx: int = 0
-  _last_contacts: list[_Contact] | None = None
+    # Visualization settings.
+    self.env_idx = 0
+    self.camera_tracking_enabled = True
+    self.show_only_selected = False
+    self.geom_groups_visible = [True, True, True, False, False, False]
+    self.site_groups_visible = [True, True, True, False, False, False]
+    self.show_contact_points = False
+    self.show_contact_forces = False
+    self.contact_point_color: tuple[int, int, int] = _DEFAULT_CONTACT_POINT_COLOR
+    self.contact_force_color: tuple[int, int, int] = _DEFAULT_CONTACT_FORCE_COLOR
+    self.meansize_override: float | None = None
+    self.needs_update = False
+    self.paused = False
 
-  # Scene offset from camera tracking, readable by subclasses.
-  _scene_offset: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
+    # Cached visualization state for re-rendering when settings change.
+    self._tracked_body_id: int | None = None
+    self._last_body_xpos: np.ndarray | None = None
+    self._last_body_xmat: np.ndarray | None = None
+    self._last_mocap_pos: np.ndarray | None = None
+    self._last_mocap_quat: np.ndarray | None = None
+    self._last_env_idx = 0
+    self._last_contacts: list[_Contact] | None = None
+    self._scene_offset = np.zeros(3)
 
-  _fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = field(
-    default_factory=dict, init=False
-  )
+    # Build the scene.
+    server.scene.configure_environment_map(
+      environment_intensity=_DEFAULT_ENVIRONMENT_INTENSITY
+    )
+    self.fixed_bodies_frame = server.scene.add_frame("/fixed_bodies", show_axes=False)
+    self._add_fixed_geometry()
+    self._create_mesh_handles_by_group()
+    self._add_fixed_sites()
+    self._create_site_handles_by_group()
+
+    for body_id in range(mj_model.nbody):
+      if not is_fixed_body(mj_model, body_id):
+        self._tracked_body_id = body_id
+        break
 
   @staticmethod
   def create(
@@ -130,57 +127,10 @@ class ViserMujocoScene:
   ) -> ViserMujocoScene:
     """Create and populate scene with geometry.
 
-    Args:
-        server: Viser server instance.
-        mj_model: MuJoCo model.
-        num_envs: Number of parallel environments.
-
-    Returns:
-        ViserMujocoScene instance with scene populated.
+    .. deprecated::
+        Use ``ViserMujocoScene(server, mj_model, num_envs)`` directly.
     """
-    mj_data = mujoco.MjData(mj_model)
-
-    scene = ViserMujocoScene(
-      server=server,
-      mj_model=mj_model,
-      mj_data=mj_data,
-      num_envs=num_envs,
-    )
-
-    # Configure environment lighting.
-    server.scene.configure_environment_map(
-      environment_intensity=_DEFAULT_ENVIRONMENT_INTENSITY
-    )
-
-    # Create frame for fixed world geometry.
-    scene.fixed_bodies_frame = server.scene.add_frame("/fixed_bodies", show_axes=False)
-
-    # Add fixed geometry (planes, terrain, etc.).
-    scene._add_fixed_geometry()
-
-    # Create mesh handles per geom group.
-    scene._create_mesh_handles_by_group()
-
-    # Add fixed site geometry.
-    scene._add_fixed_sites()
-
-    # Create site handles per site group.
-    scene._create_site_handles_by_group()
-
-    # Find first non-fixed body for camera tracking.
-    for body_id in range(mj_model.nbody):
-      if not is_fixed_body(mj_model, body_id):
-        scene._tracked_body_id = body_id
-        break
-
-    return scene
-
-  def _is_collision_geom(self, geom_id: int) -> bool:
-    """Check if a geom is a collision geom."""
-    return (
-      self.mj_model.geom_contype[geom_id] != 0
-      or self.mj_model.geom_conaffinity[geom_id] != 0
-    )
+    return ViserMujocoScene(server, mj_model, num_envs)
 
   def _sync_visibilities(self) -> None:
     """Synchronize all handle visibilities based on current flags."""
@@ -508,51 +458,55 @@ class ViserMujocoScene:
       self._last_contacts = contacts
 
     self.fixed_bodies_frame.position = scene_offset
+    tile = self.show_only_selected and self.num_envs > 1
     with self.server.atomic():
       body_xquat = vtf.SO3.from_matrix(body_xmat).wxyz
-      for (
-        body_id,
-        _group_id,
-        _sub_idx,
-      ), handle in self.mesh_handles_by_group.items():
+      for (body_id, _, _), handle in self.mesh_handles_by_group.items():
         if not handle.visible:
           continue
         mocap_id = self.mj_model.body_mocapid[body_id]
         if mocap_id >= 0:
-          if self.show_only_selected and self.num_envs > 1:
-            single_pos = mocap_pos[env_idx, mocap_id, :] + scene_offset
-            single_quat = mocap_quat[env_idx, mocap_id, :]
-            handle.batched_positions = np.tile(single_pos[None, :], (self.num_envs, 1))
-            handle.batched_wxyzs = np.tile(single_quat[None, :], (self.num_envs, 1))
-          else:
-            handle.batched_positions = mocap_pos[:, mocap_id, :] + scene_offset
-            handle.batched_wxyzs = mocap_quat[:, mocap_id, :]
+          pos, quat = self._batched_transform(
+            mocap_pos, mocap_quat, mocap_id, env_idx, scene_offset, tile
+          )
         else:
-          if self.show_only_selected and self.num_envs > 1:
-            single_pos = body_xpos[env_idx, body_id, :] + scene_offset
-            single_quat = body_xquat[env_idx, body_id, :]
-            handle.batched_positions = np.tile(single_pos[None, :], (self.num_envs, 1))
-            handle.batched_wxyzs = np.tile(single_quat[None, :], (self.num_envs, 1))
-          else:
-            handle.batched_positions = body_xpos[..., body_id, :] + scene_offset
-            handle.batched_wxyzs = body_xquat[..., body_id, :]
+          pos, quat = self._batched_transform(
+            body_xpos, body_xquat, body_id, env_idx, scene_offset, tile
+          )
+        handle.batched_positions = pos
+        handle.batched_wxyzs = quat
 
-      for (body_id, _group_id), handle in self.site_handles_by_group.items():
+      for (body_id, _), handle in self.site_handles_by_group.items():
         if not handle.visible:
           continue
-        if self.show_only_selected and self.num_envs > 1:
-          single_pos = body_xpos[env_idx, body_id, :] + scene_offset
-          single_quat = body_xquat[env_idx, body_id, :]
-          handle.batched_positions = np.tile(single_pos[None, :], (self.num_envs, 1))
-          handle.batched_wxyzs = np.tile(single_quat[None, :], (self.num_envs, 1))
-        else:
-          handle.batched_positions = body_xpos[..., body_id, :] + scene_offset
-          handle.batched_wxyzs = body_xquat[..., body_id, :]
+        pos, quat = self._batched_transform(
+          body_xpos, body_xquat, body_id, env_idx, scene_offset, tile
+        )
+        handle.batched_positions = pos
+        handle.batched_wxyzs = quat
 
       if contacts is not None:
         self._update_contact_visualization(contacts, scene_offset)
 
       self.server.flush()
+
+  def _batched_transform(
+    self,
+    positions: np.ndarray,
+    quats: np.ndarray,
+    idx: int,
+    env_idx: int,
+    scene_offset: np.ndarray,
+    tile: bool,
+  ) -> tuple[np.ndarray, np.ndarray]:
+    """Return (batched_positions, batched_wxyzs) for a single body."""
+    if tile:
+      pos = np.tile((positions[env_idx, idx] + scene_offset)[None], (self.num_envs, 1))
+      quat = np.tile(quats[env_idx, idx][None], (self.num_envs, 1))
+    else:
+      pos = positions[..., idx, :] + scene_offset
+      quat = quats[..., idx, :]
+    return pos, quat
 
   def _request_update(self) -> None:
     """Request a visualization update and trigger immediate re-render
@@ -596,59 +550,46 @@ class ViserMujocoScene:
 
   def _add_fixed_geometry(self) -> None:
     """Add fixed world geometry to the scene."""
-    body_geoms_visual: dict[int, list[int]] = {}
-    body_geoms_collision: dict[int, list[int]] = {}
-
+    body_geoms: dict[int, list[int]] = {}
     for i in range(self.mj_model.ngeom):
       body_id = self.mj_model.geom_bodyid[i]
-      target = body_geoms_collision if self._is_collision_geom(i) else body_geoms_visual
-      target.setdefault(body_id, []).append(i)
+      body_geoms.setdefault(body_id, []).append(i)
 
-    all_bodies = set(body_geoms_visual.keys()) | set(body_geoms_collision.keys())
+    for body_id, geom_ids in body_geoms.items():
+      if not is_fixed_body(self.mj_model, body_id):
+        continue
 
-    for body_id in all_bodies:
       body_name = get_body_name(self.mj_model, body_id)
+      nonplane_geom_ids: list[int] = []
+      for geom_id in geom_ids:
+        geom_type = self.mj_model.geom_type[geom_id]
+        if geom_type == mjtGeom.mjGEOM_PLANE:
+          geom_name = mj_id2name(self.mj_model, mjtObj.mjOBJ_GEOM, geom_id)
+          self.server.scene.add_grid(
+            f"/fixed_bodies/{body_name}/{geom_name}",
+            infinite_grid=True,
+            fade_distance=50.0,
+            shadow_opacity=0.2,
+            plane_opacity=0.4,
+            position=self.mj_model.geom_pos[geom_id],
+            wxyz=self.mj_model.geom_quat[geom_id],
+          )
+        else:
+          nonplane_geom_ids.append(geom_id)
 
-      if is_fixed_body(self.mj_model, body_id):
-        all_geoms = []
-        if body_id in body_geoms_visual:
-          all_geoms.extend(body_geoms_visual[body_id])
-        if body_id in body_geoms_collision:
-          all_geoms.extend(body_geoms_collision[body_id])
-
-        if not all_geoms:
-          continue
-
-        nonplane_geom_ids: list[int] = []
-        for geom_id in all_geoms:
-          geom_type = self.mj_model.geom_type[geom_id]
-          if geom_type == mjtGeom.mjGEOM_PLANE:
-            geom_name = mj_id2name(self.mj_model, mjtObj.mjOBJ_GEOM, geom_id)
-            self.server.scene.add_grid(
-              f"/fixed_bodies/{body_name}/{geom_name}",
-              infinite_grid=True,
-              fade_distance=50.0,
-              shadow_opacity=0.2,
-              plane_opacity=0.4,
-              position=self.mj_model.geom_pos[geom_id],
-              wxyz=self.mj_model.geom_quat[geom_id],
-            )
-          else:
-            nonplane_geom_ids.append(geom_id)
-
-        if len(nonplane_geom_ids) > 0:
-          subgroups = group_geoms_by_visual_compat(self.mj_model, nonplane_geom_ids)
-          for sub_idx, sub_geom_ids in enumerate(subgroups):
-            suffix = f"/sub{sub_idx}" if len(subgroups) > 1 else ""
-            self.server.scene.add_mesh_trimesh(
-              f"/fixed_bodies/{body_name}{suffix}",
-              merge_geoms(self.mj_model, sub_geom_ids),
-              cast_shadow=False,
-              receive_shadow=0.2,
-              position=self.mj_model.body(body_id).pos,
-              wxyz=self.mj_model.body(body_id).quat,
-              visible=True,
-            )
+      if nonplane_geom_ids:
+        subgroups = group_geoms_by_visual_compat(self.mj_model, nonplane_geom_ids)
+        for sub_idx, sub_geom_ids in enumerate(subgroups):
+          suffix = f"/sub{sub_idx}" if len(subgroups) > 1 else ""
+          self.server.scene.add_mesh_trimesh(
+            f"/fixed_bodies/{body_name}{suffix}",
+            merge_geoms(self.mj_model, sub_geom_ids),
+            cast_shadow=False,
+            receive_shadow=0.2,
+            position=self.mj_model.body(body_id).pos,
+            wxyz=self.mj_model.body(body_id).quat,
+            visible=True,
+          )
 
   def _create_mesh_handles_by_group(self) -> None:
     """Create mesh handles for each geom group separately."""
@@ -662,10 +603,7 @@ class ViserMujocoScene:
       if self.mj_model.geom_rgba[i, 3] == 0:
         continue
       geom_group = self.mj_model.geom_group[i]
-      key = (body_id, geom_group)
-      if key not in body_group_geoms:
-        body_group_geoms[key] = []
-      body_group_geoms[key].append(i)
+      body_group_geoms.setdefault((body_id, geom_group), []).append(i)
 
     with self.server.atomic():
       for (body_id, group_id), geom_indices in body_group_geoms.items():
@@ -755,7 +693,6 @@ class ViserMujocoScene:
         pos=con.pos.copy(),
         frame=con.frame.copy().reshape(3, 3),
         force=force[:3].copy(),
-        dist=con.dist,
         included=con.efc_address >= 0,
       )
 
@@ -765,64 +702,88 @@ class ViserMujocoScene:
     self, contacts: list[_Contact], scene_offset: np.ndarray
   ) -> None:
     """Update contact point and force visualization."""
-    import trimesh
-
-    contact_points: list[_ContactPointVisual] = []
-    contact_forces: list[_ContactForceVisual] = []
-
     meansize = self.meansize_override or self.mj_model.stat.meansize
+    z_up = np.array([0, 0, 1])
+
+    # Build arrays directly instead of intermediate dataclasses.
+    point_positions: list[np.ndarray] = []
+    point_orientations: list[np.ndarray] = []
+    point_scales: list[np.ndarray] = []
+
+    force_shaft_pos: list[np.ndarray] = []
+    force_shaft_ori: list[np.ndarray] = []
+    force_shaft_scl: list[np.ndarray] = []
+    force_head_pos: list[np.ndarray] = []
+    force_head_ori: list[np.ndarray] = []
+    force_head_scl: list[np.ndarray] = []
+
+    cw = self.mj_model.vis.scale.contactwidth * meansize
+    ch = self.mj_model.vis.scale.contactheight * meansize
+    fw = self.mj_model.vis.scale.forcewidth * meansize
+    force_scale = (
+      self.mj_model.vis.map.force / self.mj_model.stat.meanmass
+      if self.mj_model.stat.meanmass > 0
+      else 1.0
+    )
 
     for contact in contacts:
       if not contact.included:
         continue
 
-      force_world = contact.frame.T @ contact.force
-      force_mag = np.linalg.norm(force_world)
+      pos = contact.pos + scene_offset
 
       if self.show_contact_points:
-        contact_points.append(
-          _ContactPointVisual(
-            position=contact.pos + scene_offset,
-            orientation=vtf.SO3.from_matrix(
-              rotation_matrix_from_vectors(np.array([0, 0, 1]), contact.frame[0, :])
-            ).wxyz,
-            scale=np.array(
-              [
-                self.mj_model.vis.scale.contactwidth * meansize,
-                self.mj_model.vis.scale.contactwidth * meansize,
-                self.mj_model.vis.scale.contactheight * meansize,
-              ]
-            ),
-          )
+        point_positions.append(pos)
+        point_orientations.append(
+          vtf.SO3.from_matrix(
+            rotation_matrix_from_vectors(z_up, contact.frame[0, :])
+          ).wxyz
         )
+        point_scales.append(np.array([cw, cw, ch]))
 
-      if self.show_contact_forces and force_mag > 1e-6:
-        force_dir = force_world / force_mag
-        arrow_length = (
-          force_mag * (self.mj_model.vis.map.force / self.mj_model.stat.meanmass)
-          if self.mj_model.stat.meanmass > 0
-          else force_mag
-        )
-        arrow_width = self.mj_model.vis.scale.forcewidth * meansize
-        force_quat = vtf.SO3.from_matrix(
-          rotation_matrix_from_vectors(np.array([0, 0, 1]), force_dir)
-        ).wxyz
+      if self.show_contact_forces:
+        force_world = contact.frame.T @ contact.force
+        force_mag = float(np.linalg.norm(force_world))
+        if force_mag > 1e-6:
+          force_dir = force_world / force_mag
+          arrow_len = force_mag * force_scale
+          quat = vtf.SO3.from_matrix(rotation_matrix_from_vectors(z_up, force_dir)).wxyz
+          force_shaft_pos.append(pos)
+          force_shaft_ori.append(quat)
+          force_shaft_scl.append(np.array([fw, fw, arrow_len]))
+          force_head_pos.append(pos + force_dir * arrow_len)
+          force_head_ori.append(quat)
+          force_head_scl.append(np.array([fw, fw, fw]))
 
-        contact_forces.append(
-          _ContactForceVisual(
-            shaft_position=contact.pos + scene_offset,
-            shaft_orientation=force_quat,
-            shaft_scale=np.array([arrow_width, arrow_width, arrow_length]),
-            head_position=(contact.pos + scene_offset + force_dir * arrow_length),
-            head_orientation=force_quat,
-            head_scale=np.array([arrow_width, arrow_width, arrow_width]),
-          )
-        )
+    self._apply_batched_contacts(
+      point_positions,
+      point_orientations,
+      point_scales,
+      force_shaft_pos,
+      force_shaft_ori,
+      force_shaft_scl,
+      force_head_pos,
+      force_head_ori,
+      force_head_scl,
+    )
 
-    if contact_points:
-      positions = np.array([p.position for p in contact_points], dtype=np.float32)
-      orientations = np.array([p.orientation for p in contact_points], dtype=np.float32)
-      scales = np.array([p.scale for p in contact_points], dtype=np.float32)
+  def _apply_batched_contacts(
+    self,
+    point_pos: list[np.ndarray],
+    point_ori: list[np.ndarray],
+    point_scl: list[np.ndarray],
+    shaft_pos: list[np.ndarray],
+    shaft_ori: list[np.ndarray],
+    shaft_scl: list[np.ndarray],
+    head_pos: list[np.ndarray],
+    head_ori: list[np.ndarray],
+    head_scl: list[np.ndarray],
+  ) -> None:
+    """Push contact arrays to viser batched handles."""
+    if point_pos:
+      positions = np.array(point_pos, dtype=np.float32)
+      orientations = np.array(point_ori, dtype=np.float32)
+      scales = np.array(point_scl, dtype=np.float32)
       if self.contact_point_handle is None:
         mesh = trimesh.creation.cylinder(radius=1.0, height=1.0)
         self.contact_point_handle = self.server.scene.add_batched_meshes_simple(
@@ -845,31 +806,30 @@ class ViserMujocoScene:
     elif self.contact_point_handle is not None:
       self.contact_point_handle.visible = False
 
-    if contact_forces:
-      shaft_positions = np.array(
-        [f.shaft_position for f in contact_forces], dtype=np.float32
-      )
-      shaft_orientations = np.array(
-        [f.shaft_orientation for f in contact_forces], dtype=np.float32
-      )
-      shaft_scales = np.array([f.shaft_scale for f in contact_forces], dtype=np.float32)
-      head_positions = np.array(
-        [f.head_position for f in contact_forces], dtype=np.float32
-      )
-      head_orientations = np.array(
-        [f.head_orientation for f in contact_forces], dtype=np.float32
-      )
-      head_scales = np.array([f.head_scale for f in contact_forces], dtype=np.float32)
-      if self.contact_force_shaft_handle is None:
+    if shaft_pos:
+      s_pos = np.array(shaft_pos, dtype=np.float32)
+      s_ori = np.array(shaft_ori, dtype=np.float32)
+      s_scl = np.array(shaft_scl, dtype=np.float32)
+      h_pos = np.array(head_pos, dtype=np.float32)
+      h_ori = np.array(head_ori, dtype=np.float32)
+      h_scl = np.array(head_scl, dtype=np.float32)
+      if (
+        self.contact_force_shaft_handle is None
+        or self.contact_force_head_handle is None
+      ):
+        if self.contact_force_shaft_handle is not None:
+          self.contact_force_shaft_handle.remove()
+        if self.contact_force_head_handle is not None:
+          self.contact_force_head_handle.remove()
         shaft_mesh = trimesh.creation.cylinder(radius=0.4, height=1.0)
         shaft_mesh.apply_translation([0, 0, 0.5])
         self.contact_force_shaft_handle = self.server.scene.add_batched_meshes_simple(
           "/contacts/forces/shaft",
           shaft_mesh.vertices,
           shaft_mesh.faces,
-          batched_wxyzs=shaft_orientations,
-          batched_positions=shaft_positions,
-          batched_scales=shaft_scales,
+          batched_wxyzs=s_ori,
+          batched_positions=s_pos,
+          batched_scales=s_scl,
           batched_colors=np.array(self.contact_force_color, dtype=np.uint8),
           opacity=0.8,
           lod="off",
@@ -881,24 +841,22 @@ class ViserMujocoScene:
           "/contacts/forces/head",
           head_mesh.vertices,
           head_mesh.faces,
-          batched_wxyzs=head_orientations,
-          batched_positions=head_positions,
-          batched_scales=head_scales,
+          batched_wxyzs=h_ori,
+          batched_positions=h_pos,
+          batched_scales=h_scl,
           batched_colors=np.array(self.contact_force_color, dtype=np.uint8),
           opacity=0.8,
           lod="off",
           cast_shadow=False,
           receive_shadow=False,
         )
-      assert self.contact_force_shaft_handle is not None
-      assert self.contact_force_head_handle is not None
-      self.contact_force_shaft_handle.batched_positions = shaft_positions
-      self.contact_force_shaft_handle.batched_wxyzs = shaft_orientations
-      self.contact_force_shaft_handle.batched_scales = shaft_scales
+      self.contact_force_shaft_handle.batched_positions = s_pos
+      self.contact_force_shaft_handle.batched_wxyzs = s_ori
+      self.contact_force_shaft_handle.batched_scales = s_scl
       self.contact_force_shaft_handle.visible = True
-      self.contact_force_head_handle.batched_positions = head_positions
-      self.contact_force_head_handle.batched_wxyzs = head_orientations
-      self.contact_force_head_handle.batched_scales = head_scales
+      self.contact_force_head_handle.batched_positions = h_pos
+      self.contact_force_head_handle.batched_wxyzs = h_ori
+      self.contact_force_head_handle.batched_scales = h_scl
       self.contact_force_head_handle.visible = True
     elif (
       self.contact_force_shaft_handle is not None

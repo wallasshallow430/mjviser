@@ -66,7 +66,7 @@ class Viewer:
         ``mj_resetData + mj_forward``. Override this to reset
         custom simulation state (e.g. warp data).
       num_envs: Number of parallel environments (passed to
-        ``ViserMujocoScene.create``).
+        ``ViserMujocoScene``).
       server: Optional viser server. If None, one is created.
     """
     self.model = model
@@ -75,7 +75,7 @@ class Viewer:
     self._render_fn = render_fn
     self._reset_fn = reset_fn
     self._server = server or viser.ViserServer()
-    self.scene = ViserMujocoScene.create(self._server, model, num_envs=num_envs)
+    self.scene = ViserMujocoScene(self._server, model, num_envs=num_envs)
     self._lock = Lock()
 
     # Speed.
@@ -506,43 +506,34 @@ class Viewer:
     m = self.model
     d = self.data
     use_ellipsoid = bool(m.vis.global_.ellipsoidinertia)
-    # Factor: box = 3/(2m), ellipsoid = 5/(2m).
     factor = 5.0 if use_ellipsoid else 3.0
 
-    # Collect bodies with nonzero mass (skip world body 0).
-    positions = []
-    orientations = []
-    scales = []
-    for i in range(1, m.nbody):
-      mass = m.body_mass[i]
-      if mass <= 0:
-        continue
-      inertia = m.body_inertia[i]
-      f = factor / (2.0 * mass)
-      a2 = f * (-inertia[0] + inertia[1] + inertia[2])
-      b2 = f * (inertia[0] - inertia[1] + inertia[2])
-      c2 = f * (inertia[0] + inertia[1] - inertia[2])
-      half = np.sqrt(np.maximum([a2, b2, c2], 0))
-      if half.max() < 1e-8:
-        continue
+    # Vectorized inertia computation for bodies 1..nbody.
+    mass = m.body_mass[1:]
+    valid_mass = mass > 0
+    inertia = m.body_inertia[1:]  # (nbody-1, 3)
+    f = np.where(valid_mass, factor / (2.0 * np.maximum(mass, 1e-30)), 0.0)
 
-      pos = d.xipos[i] + self.scene._scene_offset
-      mat = d.ximat[i].reshape(3, 3)
-      quat = vtf.SO3.from_matrix(mat).wxyz
+    a2 = f * (-inertia[:, 0] + inertia[:, 1] + inertia[:, 2])
+    b2 = f * (inertia[:, 0] - inertia[:, 1] + inertia[:, 2])
+    c2 = f * (inertia[:, 0] + inertia[:, 1] - inertia[:, 2])
+    half = np.sqrt(np.maximum(np.column_stack([a2, b2, c2]), 0))
 
-      positions.append(pos)
-      orientations.append(quat)
-      scales.append(half)
-
-    if not positions:
+    valid = valid_mass & (half.max(axis=1) >= 1e-8)
+    if not valid.any():
       if self._inertia_handle is not None:
         self._inertia_handle.visible = False
       return
 
-    pos_arr = np.array(positions, dtype=np.float32)
-    ori_arr = np.array(orientations, dtype=np.float32)
-    scl_arr = np.array(scales, dtype=np.float32)
-    n = len(positions)
+    offset = self.scene._scene_offset
+    # Indices into the full body arrays (add 1 because we skipped body 0).
+    body_ids = np.nonzero(valid)[0] + 1
+    pos_arr = (d.xipos[body_ids] + offset).astype(np.float32)
+    ori_arr = vtf.SO3.from_matrix(d.ximat[body_ids].reshape(-1, 3, 3)).wxyz.astype(
+      np.float32
+    )
+    scl_arr = half[valid].astype(np.float32)
+    n = len(body_ids)
 
     needs_recreate = self._inertia_handle is None or n != len(
       self._inertia_handle.batched_positions
@@ -581,60 +572,63 @@ class Viewer:
     offset = self.scene._scene_offset
     scale = m.stat.meansize * 0.5
 
-    # Collect frame origins and rotation matrices.
-    positions: list[np.ndarray] = []
-    rotmats: list[np.ndarray] = []
-
+    # Gather positions and rotation matrices as contiguous arrays.
     if self._frame_mode == "Body":
-      for i in range(1, m.nbody):
-        if m.body_mass[i] <= 0:
-          continue
-        # Use CoM frame when inertia is shown, body frame otherwise.
-        if self._show_inertia:
-          positions.append(d.xipos[i] + offset)
-          rotmats.append(d.ximat[i].reshape(3, 3))
-        else:
-          positions.append(d.xpos[i] + offset)
-          rotmats.append(d.xmat[i].reshape(3, 3))
+      mask = m.body_mass[1:] > 0
+      if not mask.any():
+        for h in self._frame_handles:
+          if h is not None:
+            h.visible = False
+        return
+      ids = np.nonzero(mask)[0] + 1
+      if self._show_inertia:
+        pos_all = d.xipos[ids] + offset
+        mats = d.ximat[ids].reshape(-1, 3, 3)
+      else:
+        pos_all = d.xpos[ids] + offset
+        mats = d.xmat[ids].reshape(-1, 3, 3)
     elif self._frame_mode == "Geom":
-      for i in range(m.ngeom):
-        if m.geom_rgba[i, 3] == 0:
-          continue
-        positions.append(d.geom_xpos[i] + offset)
-        rotmats.append(d.geom_xmat[i].reshape(3, 3))
+      mask = m.geom_rgba[:, 3] != 0
+      if not mask.any():
+        for h in self._frame_handles:
+          if h is not None:
+            h.visible = False
+        return
+      ids = np.nonzero(mask)[0]
+      pos_all = d.geom_xpos[ids] + offset
+      mats = d.geom_xmat[ids].reshape(-1, 3, 3)
     elif self._frame_mode == "Site":
-      for i in range(m.nsite):
-        positions.append(d.site_xpos[i] + offset)
-        rotmats.append(d.site_xmat[i].reshape(3, 3))
-
-    if not positions:
-      for h in self._frame_handles:
-        if h is not None:
-          h.visible = False
+      if m.nsite == 0:
+        for h in self._frame_handles:
+          if h is not None:
+            h.visible = False
+        return
+      pos_all = d.site_xpos + offset
+      mats = d.site_xmat.reshape(-1, 3, 3)
+    else:
       return
 
-    n = len(positions)
+    n = len(pos_all)
+    width = scale * 0.05
     axis_colors = [
-      np.array([230, 25, 25], dtype=np.uint8),  # X red
-      np.array([25, 200, 25], dtype=np.uint8),  # Y green
-      np.array([25, 25, 230], dtype=np.uint8),  # Z blue
+      np.array([230, 25, 25], dtype=np.uint8),
+      np.array([25, 200, 25], dtype=np.uint8),
+      np.array([25, 25, 230], dtype=np.uint8),
     ]
 
     for axis in range(3):
-      # Each arrow goes from origin to origin + axis_dir * scale.
-      # We represent it as a cylinder positioned at the midpoint,
-      # oriented along the axis, scaled by length and width.
-      pos_arr = np.zeros((n, 3), dtype=np.float32)
-      ori_arr = np.zeros((n, 4), dtype=np.float32)
-      scl_arr = np.zeros((n, 3), dtype=np.float32)
-      width = scale * 0.05
+      axis_dirs = mats[:, :, axis]  # (n, 3)
+      midpoints = pos_all + axis_dirs * (scale * 0.5)
+      pos_arr = midpoints.astype(np.float32)
 
+      # Build rotation matrices aligning Z to each axis direction.
+      align_mats = np.zeros((n, 3, 3), dtype=np.float64)
       for i in range(n):
-        axis_dir = rotmats[i][:, axis]
-        midpoint = positions[i] + axis_dir * scale * 0.5
-        pos_arr[i] = midpoint
-        ori_arr[i] = vtf.SO3.from_matrix(_rotation_align(axis_dir)).wxyz
-        scl_arr[i] = [width, width, scale]
+        align_mats[i] = _rotation_align(axis_dirs[i])
+      ori_arr = vtf.SO3.from_matrix(align_mats).wxyz.astype(np.float32)
+      scl_arr = np.broadcast_to(
+        np.array([width, width, scale], dtype=np.float32), (n, 3)
+      ).copy()
 
       handle = self._frame_handles[axis]
       needs_recreate = handle is None or n != len(handle.batched_positions)
