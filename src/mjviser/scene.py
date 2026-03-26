@@ -61,6 +61,7 @@ _ARROW_HEAD = -1  # Synthetic geom type for arrow cone heads.
 
 _CAT_DECOR = int(mujoco.mjtCatBit.mjCAT_DECOR)
 _OBJ_TENDON = int(mujoco.mjtObj.mjOBJ_TENDON)
+_OBJ_JOINT = int(mujoco.mjtObj.mjOBJ_JOINT)
 
 # Cached unit meshes for decor rendering, keyed by mjtGeom int value.
 _UNIT_MESHES: dict[int, trimesh.Trimesh] = {}
@@ -1047,6 +1048,10 @@ class ViserMujocoScene:
         quat = vtf.SO3.from_matrix(mat).wxyz
         size = np.array(g.size)
         rgba = np.array(g.rgba)
+
+        # MuJoCo ignores user alpha for joint geoms; override it.
+        if int(g.objtype) == _OBJ_JOINT:
+          rgba[3] = self.mj_model.vis.rgba.joint[3]
 
         positions[j] = pos
         orientations[j] = quat
