@@ -382,6 +382,33 @@ def group_geoms_by_visual_compat(
 # ------------------------------------------------------------------
 
 
+def _can_merge_vertices(mesh: trimesh.Trimesh) -> bool:
+  """Check whether merge_vertices is safe (won't destroy per-vertex colors).
+
+  trimesh's merge_vertices merges vertices at the same position regardless
+  of vertex color.  This is unsafe when co-located vertices carry different
+  colors (e.g. cubemap-textured meshes where adjacent faces have different
+  colors at shared edges).
+  """
+  if not isinstance(mesh.visual, trimesh.visual.ColorVisuals):
+    return True
+  vc = mesh.visual.vertex_colors
+  if vc is None or len(set(map(tuple, vc))) <= 1:
+    return True
+  # Check a sample of co-located vertices for conflicting colors.
+  rounded = np.round(mesh.vertices, decimals=6)
+  _, inverse = np.unique(rounded, axis=0, return_inverse=True)
+  # Group colors by unique position.  If any position maps to multiple
+  # colors, merging would destroy information.
+  pos_color = np.empty(len(inverse), dtype=np.uint64)
+  for i in range(len(inverse)):
+    r, g, b, a = vc[i]
+    pos_color[i] = (int(r) << 24) | (int(g) << 16) | (int(b) << 8) | int(a)
+  pairs = np.column_stack([inverse, pos_color])
+  unique_pairs = np.unique(pairs, axis=0)
+  return len(unique_pairs) == len(np.unique(inverse))
+
+
 def _merge_meshes(
   meshes: list[trimesh.Trimesh],
   positions: list[np.ndarray],
@@ -395,7 +422,8 @@ def _merge_meshes(
     mesh.apply_transform(transform)
 
   result = meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
-  result.merge_vertices()
+  if _can_merge_vertices(result):
+    result.merge_vertices()
   return result
 
 
