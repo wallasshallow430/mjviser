@@ -82,6 +82,7 @@ class Viewer:
 
     # State.
     self._paused = False
+    self._dirty = True
     self._step_count = 0
 
     # Timing.
@@ -156,10 +157,10 @@ class Viewer:
     dt = now - self._last_tick
     self._last_tick = now
 
-    stepped = False
     if not self._paused:
       with self._lock:
-        stepped = self._step_physics(dt)
+        if self._step_physics(dt):
+          self._dirty = True
 
     # Render at fixed frame rate, but only when state changed.
     self._time_until_next_render -= dt
@@ -170,7 +171,8 @@ class Viewer:
     if self._time_until_next_render < -_FRAME_TIME:
       self._time_until_next_render = 0.0
 
-    if stepped or self.scene.needs_update:
+    if self._dirty or self.scene.needs_update:
+      self._dirty = False
       self._render()
     self._stats_frames += 1
     self._update_stats()

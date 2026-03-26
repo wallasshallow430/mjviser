@@ -1024,6 +1024,13 @@ class ViserMujocoScene:
 
     active_keys: set[tuple[int, bool]] = set()
 
+    # Collect arrow heads across all arrow types.
+    all_head_positions: list[np.ndarray] = []
+    all_head_orientations: list[np.ndarray] = []
+    all_head_scales: list[np.ndarray] = []
+    all_head_colors: list[np.ndarray] = []
+    all_head_opacities: list[float] = []
+
     for (geom_type, is_tendon), indices in geoms_by_key.items():
       n = len(indices)
       active_keys.add((geom_type, is_tendon))
@@ -1033,13 +1040,6 @@ class ViserMujocoScene:
       scales = np.empty((n, 3), dtype=np.float32)
       colors = np.empty((n, 3), dtype=np.uint8)
       opacities = np.empty(n, dtype=np.float32)
-
-      # For arrows, collect head data separately.
-      head_positions: list[np.ndarray] = []
-      head_orientations: list[np.ndarray] = []
-      head_scales: list[np.ndarray] = []
-      head_colors: list[np.ndarray] = []
-      head_opacities: list[float] = []
 
       for j, gi in enumerate(indices):
         g = self._mjv_scene.geoms[gi]
@@ -1073,11 +1073,11 @@ class ViserMujocoScene:
           scales[j] = [w, w, shaft_len]
           # Head: cone at the tip of the shaft.
           tip_offset = mat[:, 2] * shaft_len
-          head_positions.append(pos + tip_offset.astype(np.float32))
-          head_orientations.append(quat)
-          head_scales.append(np.array([w, w, head_len], dtype=np.float32))
-          head_colors.append(colors[j].copy())
-          head_opacities.append(opacities[j])
+          all_head_positions.append(pos + tip_offset.astype(np.float32))
+          all_head_orientations.append(quat)
+          all_head_scales.append(np.array([w, w, head_len], dtype=np.float32))
+          all_head_colors.append(colors[j].copy())
+          all_head_opacities.append(opacities[j])
         else:
           scales[j] = size
 
@@ -1086,12 +1086,13 @@ class ViserMujocoScene:
       key = (geom_type, is_tendon)
 
       handle = self._decor_handles.get(key)
-      if handle is not None and n != len(handle.batched_positions):
-        handle.remove()
-        handle = None
-        del self._decor_handles[key]
-
-      if handle is None:
+      if handle is not None and n == len(handle.batched_positions):
+        # Reuse existing handle, just update transforms.
+        handle.batched_positions = positions
+        handle.batched_wxyzs = orientations
+        handle.batched_scales = scales
+        handle.visible = True
+      else:
         unit = _get_unit_mesh(mesh_type)
         handle = self.server.scene.add_batched_meshes_simple(
           f"/decor/{geom_type}_{is_tendon}",
@@ -1107,50 +1108,40 @@ class ViserMujocoScene:
           receive_shadow=False,
         )
         self._decor_handles[key] = handle
+
+    # Create arrow heads as a single combined handle.
+    if all_head_positions:
+      head_key = (_ARROW_HEAD, False)
+      active_keys.add(head_key)
+      h_pos = np.array(all_head_positions)
+      h_ori = np.array(all_head_orientations)
+      h_scl = np.array(all_head_scales)
+      h_col = np.array(all_head_colors)
+      h_opa = np.array(all_head_opacities, dtype=np.float32)
+      nh = len(all_head_positions)
+
+      h_handle = self._decor_handles.get(head_key)
+      if h_handle is not None and nh == len(h_handle.batched_positions):
+        h_handle.batched_positions = h_pos
+        h_handle.batched_wxyzs = h_ori
+        h_handle.batched_scales = h_scl
+        h_handle.visible = True
       else:
-        handle.batched_positions = positions
-        handle.batched_wxyzs = orientations
-        handle.batched_scales = scales
-        handle.visible = True
-
-      # Create arrow heads as a separate handle.
-      if head_positions:
-        head_key = (_ARROW_HEAD, is_tendon)
-        active_keys.add(head_key)
-        h_pos = np.array(head_positions)
-        h_ori = np.array(head_orientations)
-        h_scl = np.array(head_scales)
-        h_col = np.array(head_colors)
-        h_opa = np.array(head_opacities, dtype=np.float32)
-        nh = len(head_positions)
-
-        h_handle = self._decor_handles.get(head_key)
-        if h_handle is not None and nh != len(h_handle.batched_positions):
-          h_handle.remove()
-          h_handle = None
-          del self._decor_handles[head_key]
-
-        if h_handle is None:
-          unit = _get_unit_mesh(_ARROW_HEAD)
-          h_handle = self.server.scene.add_batched_meshes_simple(
-            "/decor/arrow_heads",
-            unit.vertices,
-            unit.faces,
-            batched_wxyzs=h_ori,
-            batched_positions=h_pos,
-            batched_scales=h_scl,
-            batched_colors=h_col,
-            batched_opacities=h_opa,
-            lod="off",
-            cast_shadow=False,
-            receive_shadow=False,
-          )
-          self._decor_handles[head_key] = h_handle
-        else:
-          h_handle.batched_positions = h_pos
-          h_handle.batched_wxyzs = h_ori
-          h_handle.batched_scales = h_scl
-          h_handle.visible = True
+        unit = _get_unit_mesh(_ARROW_HEAD)
+        h_handle = self.server.scene.add_batched_meshes_simple(
+          "/decor/arrow_heads",
+          unit.vertices,
+          unit.faces,
+          batched_wxyzs=h_ori,
+          batched_positions=h_pos,
+          batched_scales=h_scl,
+          batched_colors=h_col,
+          batched_opacities=h_opa,
+          lod="off",
+          cast_shadow=False,
+          receive_shadow=False,
+        )
+        self._decor_handles[head_key] = h_handle
 
     # Hide handles for types not present this frame.
     for key, handle in self._decor_handles.items():
