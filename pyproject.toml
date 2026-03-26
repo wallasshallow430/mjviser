@@ -46,10 +46,9 @@ dev = [
 
 [dependency-groups]
 dev = [
-    "mujoco-warp",
-    "pyright>=1.1.408",
-    "pytest>=9.0.2",
-    "ruff>=0.15.7",
+  "pyright>=1.1.408",
+  "pytest>=9.0.2",
+  "ruff>=0.15.7",
 ]
 
 [tool.ruff]
@@ -75,6 +74,3 @@ extra-paths = ["typings"]
 [tool.ty.src]
 include = ["src"]
 exclude = ["typings"]
-
-[tool.uv.sources]
-mujoco-warp = { path = "../mujoco_warp", editable = true }
