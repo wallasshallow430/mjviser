@@ -662,6 +662,9 @@ class ViserMujocoScene:
       body_id = self.mj_model.geom_bodyid[i]
       if is_fixed_body(self.mj_model, body_id):
         continue
+      # Skip fully transparent geoms (alpha == 0).
+      if self.mj_model.geom_rgba[i, 3] == 0:
+        continue
       geom_group = self.mj_model.geom_group[i]
       key = (body_id, geom_group)
       if key not in body_group_geoms:

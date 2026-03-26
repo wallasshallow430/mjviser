@@ -9,7 +9,9 @@ from threading import Lock
 
 import mujoco
 import numpy as np
+import trimesh
 import viser
+import viser.transforms as vtf
 
 from .scene import ViserMujocoScene
 
@@ -79,6 +81,8 @@ class Viewer:
     # Speed.
     self._speed_idx = _SPEEDS.index(1.0)
     self._joint_sliders: list = []
+    self._show_inertia = False
+    self._inertia_handle: viser.BatchedMeshHandle | None = None
 
     # State.
     self._paused = False
@@ -113,6 +117,8 @@ class Viewer:
       self._render_fn(self.scene)
     else:
       self.scene.update_from_mjdata(self.data)
+    if self._show_inertia:
+      self._render_inertia()
 
   def _reset(self) -> None:
     """Reset the simulation."""
@@ -318,6 +324,14 @@ class Viewer:
       with self._server.gui.add_folder("Scene"):
         self.scene.create_visualization_gui()
 
+        cb_inertia = self._server.gui.add_checkbox("Show Inertia", initial_value=False)
+
+        @cb_inertia.on_update
+        def _(_) -> None:
+          self._show_inertia = cb_inertia.value
+          if not self._show_inertia and self._inertia_handle is not None:
+            self._inertia_handle.visible = False
+
     # Groups tab (geom/site visibility).
     self.scene.create_groups_gui(tabs)
 
@@ -325,6 +339,10 @@ class Viewer:
     with tabs.add_tab("Actuation", icon=viser.Icon.ADJUSTMENTS):
       self._setup_joint_sliders()
       self._setup_actuator_sliders()
+
+    # Physics tab (disable/enable flags).
+    with tabs.add_tab("Physics", icon=viser.Icon.ATOM):
+      self._setup_physics_flags()
 
   def _setup_joint_sliders(self) -> None:
     """Add per-joint sliders for hinge and slide joints."""
@@ -402,3 +420,131 @@ class Viewer:
             self.data.ctrl[_id] = _sl.value
 
         slider.on_update(_on_update)
+
+  def _setup_physics_flags(self) -> None:
+    """Add checkboxes for MuJoCo disable and enable flags."""
+    disable_flags = [
+      ("Gravity", mujoco.mjtDisableBit.mjDSBL_GRAVITY),
+      ("Contact", mujoco.mjtDisableBit.mjDSBL_CONTACT),
+      ("Constraint", mujoco.mjtDisableBit.mjDSBL_CONSTRAINT),
+      ("Equality", mujoco.mjtDisableBit.mjDSBL_EQUALITY),
+      ("Limit", mujoco.mjtDisableBit.mjDSBL_LIMIT),
+      ("Spring", mujoco.mjtDisableBit.mjDSBL_SPRING),
+      ("Damper", mujoco.mjtDisableBit.mjDSBL_DAMPER),
+      ("Friction Loss", mujoco.mjtDisableBit.mjDSBL_FRICTIONLOSS),
+      ("Actuation", mujoco.mjtDisableBit.mjDSBL_ACTUATION),
+      ("Sensor", mujoco.mjtDisableBit.mjDSBL_SENSOR),
+      ("Warmstart", mujoco.mjtDisableBit.mjDSBL_WARMSTART),
+      ("Filter Parent", mujoco.mjtDisableBit.mjDSBL_FILTERPARENT),
+      ("Clamp Ctrl", mujoco.mjtDisableBit.mjDSBL_CLAMPCTRL),
+      ("Euler Damp", mujoco.mjtDisableBit.mjDSBL_EULERDAMP),
+      ("Refsafe", mujoco.mjtDisableBit.mjDSBL_REFSAFE),
+    ]
+
+    enable_flags = [
+      ("Energy", mujoco.mjtEnableBit.mjENBL_ENERGY),
+      ("Override", mujoco.mjtEnableBit.mjENBL_OVERRIDE),
+      ("Fwd Inverse", mujoco.mjtEnableBit.mjENBL_FWDINV),
+      ("Multi CCD", mujoco.mjtEnableBit.mjENBL_MULTICCD),
+    ]
+
+    with self._server.gui.add_folder("Disable Flags"):
+      for label, flag in disable_flags:
+        bit = int(flag)
+        active = bool(self.model.opt.disableflags & bit)
+        cb = self._server.gui.add_checkbox(label, initial_value=active)
+
+        def _on_toggle(_, _bit=bit, _cb=cb) -> None:
+          if _cb.value:
+            self.model.opt.disableflags |= _bit
+          else:
+            self.model.opt.disableflags &= ~_bit
+
+        cb.on_update(_on_toggle)
+
+    with self._server.gui.add_folder("Enable Flags"):
+      for label, flag in enable_flags:
+        bit = int(flag)
+        active = bool(self.model.opt.enableflags & bit)
+        cb = self._server.gui.add_checkbox(label, initial_value=active)
+
+        def _on_toggle(_, _bit=bit, _cb=cb) -> None:
+          if _cb.value:
+            self.model.opt.enableflags |= _bit
+          else:
+            self.model.opt.enableflags &= ~_bit
+
+        cb.on_update(_on_toggle)
+
+  def _render_inertia(self) -> None:
+    """Render equivalent inertia shapes at each body's center of mass."""
+    m = self.model
+    d = self.data
+    use_ellipsoid = bool(m.vis.global_.ellipsoidinertia)
+    # Factor: box = 3/(2m), ellipsoid = 5/(2m).
+    factor = 5.0 if use_ellipsoid else 3.0
+
+    # Collect bodies with nonzero mass (skip world body 0).
+    positions = []
+    orientations = []
+    scales = []
+    for i in range(1, m.nbody):
+      mass = m.body_mass[i]
+      if mass <= 0:
+        continue
+      inertia = m.body_inertia[i]
+      f = factor / (2.0 * mass)
+      a2 = f * (-inertia[0] + inertia[1] + inertia[2])
+      b2 = f * (inertia[0] - inertia[1] + inertia[2])
+      c2 = f * (inertia[0] + inertia[1] - inertia[2])
+      half = np.sqrt(np.maximum([a2, b2, c2], 0))
+      if half.max() < 1e-8:
+        continue
+
+      pos = d.xipos[i] + self.scene._scene_offset
+      mat = d.ximat[i].reshape(3, 3)
+      quat = vtf.SO3.from_matrix(mat).wxyz
+
+      positions.append(pos)
+      orientations.append(quat)
+      scales.append(half)
+
+    if not positions:
+      if self._inertia_handle is not None:
+        self._inertia_handle.visible = False
+      return
+
+    pos_arr = np.array(positions, dtype=np.float32)
+    ori_arr = np.array(orientations, dtype=np.float32)
+    scl_arr = np.array(scales, dtype=np.float32)
+    n = len(positions)
+
+    needs_recreate = self._inertia_handle is None or n != len(
+      self._inertia_handle.batched_positions
+    )
+
+    if needs_recreate:
+      if self._inertia_handle is not None:
+        self._inertia_handle.remove()
+      if use_ellipsoid:
+        unit = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+      else:
+        unit = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+      self._inertia_handle = self._server.scene.add_batched_meshes_simple(
+        "/inertia",
+        unit.vertices,
+        unit.faces,
+        batched_wxyzs=ori_arr,
+        batched_positions=pos_arr,
+        batched_scales=scl_arr,
+        batched_colors=np.tile(np.array([255, 180, 60], dtype=np.uint8), (n, 1)),
+        opacity=0.5,
+        cast_shadow=False,
+        receive_shadow=False,
+      )
+    else:
+      assert self._inertia_handle is not None
+      self._inertia_handle.batched_positions = pos_arr
+      self._inertia_handle.batched_wxyzs = ori_arr
+      self._inertia_handle.batched_scales = scl_arr
+      self._inertia_handle.visible = True
