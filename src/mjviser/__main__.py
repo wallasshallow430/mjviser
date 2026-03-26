@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import sys
 from pathlib import Path
@@ -92,11 +93,23 @@ def _resolve_path(arg: str) -> Path:
 
 
 def main() -> None:
-  if len(sys.argv) < 2:
-    print("Usage: mjviser <model.xml>")
-    sys.exit(1)
+  parser = argparse.ArgumentParser(
+    prog="mjviser",
+    description=(
+      "Interactive MuJoCo viewer powered by Viser.\n\n"
+      "MODEL can be a file path, a robot_descriptions name (e.g. 'go1'),\n"
+      "or a substring / glob pattern to search under the current directory."
+    ),
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+  )
+  parser.add_argument(
+    "model",
+    metavar="MODEL",
+    help="path, robot_descriptions name, or search pattern for a .xml model",
+  )
+  args = parser.parse_args()
 
-  path = _resolve_path(sys.argv[1])
+  path = _resolve_path(args.model)
   model = mujoco.MjModel.from_xml_path(str(path))
   data = mujoco.MjData(model)
   Viewer(model, data).run()
