@@ -335,6 +335,8 @@ class Viewer:
     with tabs.add_tab("Physics", icon=viser.Icon.ATOM):
       self._setup_physics_flags()
 
+  _MAX_SLIDERS: int = 50
+
   def _setup_joint_sliders(self) -> None:
     """Add per-joint sliders for hinge and slide joints."""
     # Only hinge (3) and slide (2) joints get sliders.
@@ -354,6 +356,13 @@ class Viewer:
       joints.append((i, name, round(float(lo), 3), round(float(hi), 3)))
 
     if not joints:
+      return
+
+    if len(joints) > self._MAX_SLIDERS:
+      self._server.gui.add_markdown(
+        f"*Joint sliders disabled ({len(joints)} joints exceed limit of"
+        f" {self._MAX_SLIDERS}).*"
+      )
       return
 
     with self._server.gui.add_folder("Joints", expand_by_default=False):
@@ -394,6 +403,13 @@ class Viewer:
       else:
         lo, hi = -1.0, 1.0
       actuators.append((i, name, round(float(lo), 3), round(float(hi), 3)))
+
+    if len(actuators) > self._MAX_SLIDERS:
+      self._server.gui.add_markdown(
+        f"*Actuator sliders disabled ({len(actuators)} actuators exceed"
+        f" limit of {self._MAX_SLIDERS}).*"
+      )
+      return
 
     with self._server.gui.add_folder("Actuators"):
       for act_id, name, lo, hi in actuators:

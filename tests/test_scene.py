@@ -10,14 +10,16 @@ from mjviser.conversions import is_fixed_body
 
 def test_scene_creates_mesh_handles(scene, simple_model):
   # box_body has 3 geoms (box, sphere, capsule), all non-fixed.
-  assert len(scene.mesh_handles_by_group) > 0
-  for body_id, _, _ in scene.mesh_handles_by_group:
-    assert not is_fixed_body(simple_model, body_id)
+  assert len(scene._mesh_groups) > 0
+  for mg in scene._mesh_groups:
+    for body_id in mg.body_ids:
+      assert not is_fixed_body(simple_model, body_id)
 
 
 def test_scene_no_handles_for_fixed_bodies(scene, simple_model):
-  for body_id, _, _ in scene.mesh_handles_by_group:
-    assert body_id != 0, "World body should not have batched handles"
+  for mg in scene._mesh_groups:
+    for body_id in mg.body_ids:
+      assert body_id != 0, "World body should not have batched handles"
 
 
 def test_scene_fixed_bodies_frame_exists(scene):

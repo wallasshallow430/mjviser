@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections import defaultdict
 
 import mujoco
@@ -18,6 +19,17 @@ from .conversions import (
   merge_geoms,
   merge_sites,
 )
+
+
+@dataclasses.dataclass
+class _MeshGroup:
+  """A group of bodies sharing identical geometry, rendered as one batched handle."""
+
+  handle: viser.BatchedGlbHandle
+  body_ids: np.ndarray  # (N,) int32 array of body IDs
+  group_id: int
+  mocap_ids: np.ndarray | None  # (N,) int32 mocap IDs, or None if non-mocap
+
 
 # Viser visualization defaults.
 _DEFAULT_FOV_DEGREES = 60
@@ -107,7 +119,7 @@ class ViserMujocoScene:
     self.num_envs = num_envs
 
     # mjvScene infrastructure for decor visualization.
-    self._mjv_scene = mujoco.MjvScene(mj_model, maxgeom=2000)
+    self._mjv_scene = mujoco.MjvScene(mj_model, maxgeom=max(2000, mj_model.ngeom * 2))
     self._mjv_option = mujoco.MjvOption()
     self._mjv_camera = mujoco.MjvCamera()
     # Disable all vis flags; properties below enable them on demand.
@@ -115,7 +127,7 @@ class ViserMujocoScene:
     self._mjv_option.frame = int(mujoco.mjtFrame.mjFRAME_NONE)
 
     # Handles.
-    self.mesh_handles_by_group: dict[tuple[int, int, int], viser.BatchedGlbHandle] = {}
+    self._mesh_groups: list[_MeshGroup] = []
     self.site_handles_by_group: dict[tuple[int, int], viser.BatchedGlbHandle] = {}
     self._decor_handles: dict[tuple[int, bool], viser.BatchedMeshHandle] = {}
     self._fixed_geom_handles: dict[tuple[int, int, int], viser.GlbHandle] = {}
@@ -225,8 +237,8 @@ class ViserMujocoScene:
 
   def _sync_visibilities(self) -> None:
     """Synchronize all handle visibilities based on current flags."""
-    for (_, group_id, _), handle in self.mesh_handles_by_group.items():
-      handle.visible = group_id < 6 and self.geom_groups_visible[group_id]
+    for mg in self._mesh_groups:
+      mg.handle.visible = mg.group_id < 6 and self.geom_groups_visible[mg.group_id]
 
     for (_, group_id, _), handle in self._fixed_geom_handles.items():
       handle.visible = group_id < 6 and self.geom_groups_visible[group_id]
@@ -686,20 +698,19 @@ class ViserMujocoScene:
     tile = self.show_only_selected and self.num_envs > 1
     with self.server.atomic():
       body_xquat = vtf.SO3.from_matrix(body_xmat).wxyz
-      for (body_id, _, _), handle in self.mesh_handles_by_group.items():
-        if not handle.visible:
+      for mg in self._mesh_groups:
+        if not mg.handle.visible:
           continue
-        mocap_id = self.mj_model.body_mocapid[body_id]
-        if mocap_id >= 0:
-          pos, quat = self._batched_transform(
-            mocap_pos, mocap_quat, mocap_id, env_idx, scene_offset, tile
+        if mg.mocap_ids is not None:
+          pos, quat = self._batched_transform_group(
+            mocap_pos, mocap_quat, mg.mocap_ids, env_idx, scene_offset, tile
           )
         else:
-          pos, quat = self._batched_transform(
-            body_xpos, body_xquat, body_id, env_idx, scene_offset, tile
+          pos, quat = self._batched_transform_group(
+            body_xpos, body_xquat, mg.body_ids, env_idx, scene_offset, tile
           )
-        handle.batched_positions = pos
-        handle.batched_wxyzs = quat
+        mg.handle.batched_positions = pos
+        mg.handle.batched_wxyzs = quat
 
       for (body_id, _), handle in self.site_handles_by_group.items():
         if not handle.visible:
@@ -733,6 +744,31 @@ class ViserMujocoScene:
     else:
       pos = positions[..., idx, :] + scene_offset
       quat = quats[..., idx, :]
+    return pos, quat
+
+  def _batched_transform_group(
+    self,
+    positions: np.ndarray,
+    quats: np.ndarray,
+    ids: np.ndarray,
+    env_idx: int,
+    scene_offset: np.ndarray,
+    tile: bool,
+  ) -> tuple[np.ndarray, np.ndarray]:
+    """Return (batched_positions, batched_wxyzs) for a group of bodies.
+
+    Gathers transforms for all body IDs in ``ids`` and flattens
+    the result to ``(num_envs * len(ids), 3/4)``.
+    """
+    if tile:
+      # Show only selected env, tiled for all envs.
+      # positions[env_idx, ids] → (N, 3)
+      pos = np.tile(positions[env_idx, ids] + scene_offset, (self.num_envs, 1))
+      quat = np.tile(quats[env_idx, ids], (self.num_envs, 1))
+    else:
+      # positions[:, ids, :] → (num_envs, N, 3) → (num_envs * N, 3)
+      pos = (positions[:, ids, :] + scene_offset).reshape(-1, 3)
+      quat = quats[:, ids, :].reshape(-1, 4)
     return pos, quat
 
   def request_update(self) -> None:
@@ -813,43 +849,83 @@ class ViserMujocoScene:
         )
         self._fixed_geom_handles[(body_id, group_id, sub_idx)] = handle
 
-  def _create_mesh_handles_by_group(self) -> None:
-    """Create mesh handles for each geom group separately."""
-    body_group_geoms: dict[tuple[int, int], list[int]] = {}
+  @staticmethod
+  def _geom_subgroup_fingerprint(
+    mj_model: mujoco.MjModel, geom_ids: list[int], is_mocap: bool
+  ) -> tuple[object, ...]:
+    """Compute a hashable fingerprint for a set of geoms in one body.
 
+    Bodies whose subgroups share a fingerprint have identical local
+    geometry and can be rendered with a single batched handle.
+    """
+    parts: list[tuple[object, ...]] = []
+    for gid in geom_ids:
+      parts.append(
+        (
+          int(mj_model.geom_type[gid]),
+          int(mj_model.geom_dataid[gid]),
+          int(mj_model.geom_matid[gid]),
+          tuple(mj_model.geom_size[gid].round(6).tolist()),
+          tuple(mj_model.geom_rgba[gid].round(4).tolist()),
+          tuple(mj_model.geom_pos[gid].round(6).tolist()),
+          tuple(mj_model.geom_quat[gid].round(6).tolist()),
+        )
+      )
+    return (is_mocap, tuple(sorted(parts)))
+
+  def _create_mesh_handles_by_group(self) -> None:
+    """Create mesh handles, deduplicating identical geometries across bodies."""
+    # Step 1: Group geoms by (body_id, group_id).
+    body_group_geoms: dict[tuple[int, int], list[int]] = {}
     for i in range(self.mj_model.ngeom):
       body_id = self.mj_model.geom_bodyid[i]
       if is_fixed_body(self.mj_model, body_id):
         continue
-      # Skip fully transparent geoms (alpha == 0).
       if self.mj_model.geom_rgba[i, 3] == 0:
         continue
       geom_group = self.mj_model.geom_group[i]
       body_group_geoms.setdefault((body_id, geom_group), []).append(i)
 
+    # Group bodies sharing identical geometry by fingerprint.
+    fp_info: dict[tuple[object, ...], tuple[list[int], list[int], bool, int, int]] = {}
+    for (body_id, group_id), geom_indices in body_group_geoms.items():
+      subgroups = group_geoms_by_visual_compat(self.mj_model, geom_indices)
+      is_mocap = bool(self.mj_model.body_mocapid[body_id] >= 0)
+      for sub_idx, sub_geom_ids in enumerate(subgroups):
+        fp = self._geom_subgroup_fingerprint(self.mj_model, sub_geom_ids, is_mocap)
+        key = (fp, group_id, sub_idx)
+        if key in fp_info:
+          fp_info[key][0].append(body_id)
+        else:
+          fp_info[key] = ([body_id], sub_geom_ids, is_mocap, group_id, sub_idx)
+
+    # Create one batched handle per unique geometry.
     with self.server.atomic():
-      for (body_id, group_id), geom_indices in body_group_geoms.items():
-        body_name = get_body_name(self.mj_model, body_id)
-        subgroups = group_geoms_by_visual_compat(self.mj_model, geom_indices)
+      for body_ids, geom_ids, is_mocap, group_id, sub_idx in fp_info.values():
+        mesh = merge_geoms(self.mj_model, geom_ids)
+        lod_ratio = 1000.0 / mesh.vertices.shape[0]
+
+        batch_count = len(body_ids) * self.num_envs
+        body_name = get_body_name(self.mj_model, body_ids[0])
+        suffix = f"/sub{sub_idx}" if sub_idx > 0 else ""
         visible = group_id < 6 and self.geom_groups_visible[group_id]
 
-        for sub_idx, sub_geom_ids in enumerate(subgroups):
-          mesh = merge_geoms(self.mj_model, sub_geom_ids)
-          lod_ratio = 1000.0 / mesh.vertices.shape[0]
-          suffix = f"/sub{sub_idx}" if len(subgroups) > 1 else ""
-          handle = self.server.scene.add_batched_meshes_trimesh(
-            f"/bodies/{body_name}/group{group_id}{suffix}",
-            mesh,
-            batched_wxyzs=np.array([1.0, 0.0, 0.0, 0.0])[None].repeat(
-              self.num_envs, axis=0
-            ),
-            batched_positions=np.array([0.0, 0.0, 0.0])[None].repeat(
-              self.num_envs, axis=0
-            ),
-            lod=((2.0, lod_ratio),) if lod_ratio < 0.5 else "off",
-            visible=visible,
+        handle = self.server.scene.add_batched_meshes_trimesh(
+          f"/bodies/{body_name}/group{group_id}{suffix}",
+          mesh,
+          batched_wxyzs=np.tile([1.0, 0.0, 0.0, 0.0], (batch_count, 1)),
+          batched_positions=np.zeros((batch_count, 3)),
+          lod=((2.0, lod_ratio),) if lod_ratio < 0.5 else "off",
+          visible=visible,
+        )
+
+        body_ids_arr = np.array(body_ids, dtype=np.int32)
+        mocap_ids: np.ndarray | None = None
+        if is_mocap:
+          mocap_ids = np.array(
+            [self.mj_model.body_mocapid[b] for b in body_ids], dtype=np.int32
           )
-          self.mesh_handles_by_group[(body_id, group_id, sub_idx)] = handle
+        self._mesh_groups.append(_MeshGroup(handle, body_ids_arr, group_id, mocap_ids))
 
   def _add_fixed_sites(self) -> None:
     """Add fixed site geometry to the scene as static nodes."""
