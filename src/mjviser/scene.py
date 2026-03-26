@@ -359,40 +359,36 @@ class ViserMujocoScene:
         self.meansize_override = meansize_input.value
         self._request_update()
 
-  def create_groups_gui(self, tabs) -> None:
-    """Add unified groups tab with geoms and sites folders.
+  def create_groups_gui(self) -> None:
+    """Add geom and site group visibility checkboxes into the
+    current GUI context."""
+    with self.server.gui.add_folder("Geoms"):
+      for i in range(6):
+        cb = self.server.gui.add_checkbox(
+          f"G{i}",
+          initial_value=self.geom_groups_visible[i],
+          hint=f"Show/hide geometry in group {i}",
+        )
 
-    Args:
-        tabs: The viser tab group to add the groups tab to.
-    """
-    with tabs.add_tab("Groups", icon=viser.Icon.EYE):
-      with self.server.gui.add_folder("Geoms"):
-        for i in range(6):
-          cb = self.server.gui.add_checkbox(
-            f"G{i}",
-            initial_value=self.geom_groups_visible[i],
-            hint=f"Show/hide geometry in group {i}",
-          )
+        @cb.on_update
+        def _(event, group_idx=i) -> None:
+          self.geom_groups_visible[group_idx] = event.target.value
+          self._sync_visibilities()
+          self._request_update()
 
-          @cb.on_update
-          def _(event, group_idx=i) -> None:
-            self.geom_groups_visible[group_idx] = event.target.value
-            self._sync_visibilities()
-            self._request_update()
+    with self.server.gui.add_folder("Sites"):
+      for i in range(6):
+        cb = self.server.gui.add_checkbox(
+          f"S{i}",
+          initial_value=self.site_groups_visible[i],
+          hint=f"Show/hide sites in group {i}",
+        )
 
-      with self.server.gui.add_folder("Sites"):
-        for i in range(6):
-          cb = self.server.gui.add_checkbox(
-            f"S{i}",
-            initial_value=self.site_groups_visible[i],
-            hint=f"Show/hide sites in group {i}",
-          )
-
-          @cb.on_update
-          def _(event, group_idx=i) -> None:
-            self.site_groups_visible[group_idx] = event.target.value
-            self._sync_visibilities()
-            self._request_update()
+        @cb.on_update
+        def _(event, group_idx=i) -> None:
+          self.site_groups_visible[group_idx] = event.target.value
+          self._sync_visibilities()
+          self._request_update()
 
   def update_from_arrays(
     self,

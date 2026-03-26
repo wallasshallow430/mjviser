@@ -83,6 +83,12 @@ class Viewer:
     self._joint_sliders: list = []
     self._show_inertia = False
     self._inertia_handle: viser.BatchedMeshHandle | None = None
+    self._frame_mode: str = "None"
+    self._frame_handles: list[viser.BatchedMeshHandle | None] = [
+      None,
+      None,
+      None,
+    ]
 
     # State.
     self._paused = False
@@ -119,6 +125,8 @@ class Viewer:
       self.scene.update_from_mjdata(self.data)
     if self._show_inertia:
       self._render_inertia()
+    if self._frame_mode != "None":
+      self._render_frames()
 
   def _reset(self) -> None:
     """Reset the simulation."""
@@ -324,16 +332,10 @@ class Viewer:
       with self._server.gui.add_folder("Scene"):
         self.scene.create_visualization_gui()
 
-        cb_inertia = self._server.gui.add_checkbox("Show Inertia", initial_value=False)
-
-        @cb_inertia.on_update
-        def _(_) -> None:
-          self._show_inertia = cb_inertia.value
-          if not self._show_inertia and self._inertia_handle is not None:
-            self._inertia_handle.visible = False
-
-    # Groups tab (geom/site visibility).
-    self.scene.create_groups_gui(tabs)
+    # Groups tab (geom/site visibility + rendering options).
+    with tabs.add_tab("Groups", icon=viser.Icon.EYE):
+      self.scene.create_groups_gui()
+      self._setup_rendering_options()
 
     # Actuation tab (joint/actuator sliders).
     with tabs.add_tab("Actuation", icon=viser.Icon.ADJUSTMENTS):
@@ -420,6 +422,29 @@ class Viewer:
             self.data.ctrl[_id] = _sl.value
 
         slider.on_update(_on_update)
+
+  def _setup_rendering_options(self) -> None:
+    """Add frame and inertia visualization controls."""
+    with self._server.gui.add_folder("Rendering"):
+      frame_dropdown = self._server.gui.add_dropdown(
+        "Frames", options=["None", "Body", "Geom", "Site"]
+      )
+
+      @frame_dropdown.on_update
+      def _(_) -> None:
+        self._frame_mode = frame_dropdown.value
+        if self._frame_mode == "None":
+          for h in self._frame_handles:
+            if h is not None:
+              h.visible = False
+
+      cb_inertia = self._server.gui.add_checkbox("Inertia", initial_value=False)
+
+      @cb_inertia.on_update
+      def _(_) -> None:
+        self._show_inertia = cb_inertia.value
+        if not self._show_inertia and self._inertia_handle is not None:
+          self._inertia_handle.visible = False
 
   def _setup_physics_flags(self) -> None:
     """Add checkboxes for MuJoCo disable and enable flags."""
@@ -548,3 +573,103 @@ class Viewer:
       self._inertia_handle.batched_wxyzs = ori_arr
       self._inertia_handle.batched_scales = scl_arr
       self._inertia_handle.visible = True
+
+  def _render_frames(self) -> None:
+    """Render coordinate frames for bodies, geoms, or sites."""
+    m = self.model
+    d = self.data
+    offset = self.scene._scene_offset
+    scale = m.stat.meansize * 0.5
+
+    # Collect frame origins and rotation matrices.
+    positions: list[np.ndarray] = []
+    rotmats: list[np.ndarray] = []
+
+    if self._frame_mode == "Body":
+      for i in range(1, m.nbody):
+        if m.body_mass[i] <= 0:
+          continue
+        # Use CoM frame when inertia is shown, body frame otherwise.
+        if self._show_inertia:
+          positions.append(d.xipos[i] + offset)
+          rotmats.append(d.ximat[i].reshape(3, 3))
+        else:
+          positions.append(d.xpos[i] + offset)
+          rotmats.append(d.xmat[i].reshape(3, 3))
+    elif self._frame_mode == "Geom":
+      for i in range(m.ngeom):
+        if m.geom_rgba[i, 3] == 0:
+          continue
+        positions.append(d.geom_xpos[i] + offset)
+        rotmats.append(d.geom_xmat[i].reshape(3, 3))
+    elif self._frame_mode == "Site":
+      for i in range(m.nsite):
+        positions.append(d.site_xpos[i] + offset)
+        rotmats.append(d.site_xmat[i].reshape(3, 3))
+
+    if not positions:
+      for h in self._frame_handles:
+        if h is not None:
+          h.visible = False
+      return
+
+    n = len(positions)
+    axis_colors = [
+      np.array([230, 25, 25], dtype=np.uint8),  # X red
+      np.array([25, 200, 25], dtype=np.uint8),  # Y green
+      np.array([25, 25, 230], dtype=np.uint8),  # Z blue
+    ]
+
+    for axis in range(3):
+      # Each arrow goes from origin to origin + axis_dir * scale.
+      # We represent it as a cylinder positioned at the midpoint,
+      # oriented along the axis, scaled by length and width.
+      pos_arr = np.zeros((n, 3), dtype=np.float32)
+      ori_arr = np.zeros((n, 4), dtype=np.float32)
+      scl_arr = np.zeros((n, 3), dtype=np.float32)
+      width = scale * 0.05
+
+      for i in range(n):
+        axis_dir = rotmats[i][:, axis]
+        midpoint = positions[i] + axis_dir * scale * 0.5
+        pos_arr[i] = midpoint
+        ori_arr[i] = vtf.SO3.from_matrix(_rotation_align(axis_dir)).wxyz
+        scl_arr[i] = [width, width, scale]
+
+      handle = self._frame_handles[axis]
+      needs_recreate = handle is None or n != len(handle.batched_positions)
+
+      if needs_recreate:
+        if handle is not None:
+          handle.remove()
+        cyl = trimesh.creation.cylinder(radius=1.0, height=1.0)
+        self._frame_handles[axis] = self._server.scene.add_batched_meshes_simple(
+          f"/frames/axis_{axis}",
+          cyl.vertices,
+          cyl.faces,
+          batched_wxyzs=ori_arr,
+          batched_positions=pos_arr,
+          batched_scales=scl_arr,
+          batched_colors=np.tile(axis_colors[axis], (n, 1)),
+          cast_shadow=False,
+          receive_shadow=False,
+        )
+      else:
+        assert handle is not None
+        handle.batched_positions = pos_arr
+        handle.batched_wxyzs = ori_arr
+        handle.batched_scales = scl_arr
+        handle.visible = True
+
+
+def _rotation_align(direction: np.ndarray) -> np.ndarray:
+  """3x3 rotation matrix aligning Z axis to the given direction."""
+  d = direction / np.linalg.norm(direction)
+  if abs(d[2]) > 0.999:
+    up = np.array([1.0, 0.0, 0.0])
+  else:
+    up = np.array([0.0, 0.0, 1.0])
+  x = np.cross(up, d)
+  x /= np.linalg.norm(x)
+  y = np.cross(d, x)
+  return np.column_stack([x, y, d])
