@@ -79,8 +79,6 @@ class Viewer:
     # Speed.
     self._speed_idx = _SPEEDS.index(1.0)
     self._joint_sliders: list = []
-    # Tendon default: show if model has tendons.
-    self.scene.show_tendons = model.ntendon > 0
 
     # State.
     self._paused = False
@@ -316,14 +314,17 @@ class Viewer:
               self._render()
               self._update_status_display()
 
-      # Scene controls (camera, environment, contacts).
+      # Scene controls (camera, environment).
       with self._server.gui.add_folder("Scene"):
-        self.scene.create_visualization_gui()
+        self.scene.create_scene_gui()
 
-    # Groups tab (geom/site visibility + rendering options).
-    with tabs.add_tab("Groups", icon=viser.Icon.EYE):
+    # Visualization tab (overlays, colors, scale).
+    with tabs.add_tab("Visualization", icon=viser.Icon.EYE):
+      self.scene.create_overlay_gui()
+
+    # Groups tab (geom/site/joint/tendon/actuator visibility).
+    with tabs.add_tab("Groups", icon=viser.Icon.LAYERS_INTERSECT):
       self.scene.create_groups_gui()
-      self._setup_rendering_options()
 
     # Actuation tab (joint/actuator sliders).
     with tabs.add_tab("Actuation", icon=viser.Icon.ADJUSTMENTS):
@@ -410,25 +411,6 @@ class Viewer:
             self.data.ctrl[_id] = _sl.value
 
         slider.on_update(_on_update)
-
-  def _setup_rendering_options(self) -> None:
-    """Add frame and inertia visualization controls."""
-    with self._server.gui.add_folder("Rendering"):
-      frame_dropdown = self._server.gui.add_dropdown(
-        "Frames", options=["None", "Body", "Geom", "Site"]
-      )
-
-      @frame_dropdown.on_update
-      def _(_) -> None:
-        self.scene.frame_mode = frame_dropdown.value
-        self.scene.request_update()
-
-      cb_inertia = self._server.gui.add_checkbox("Inertia", initial_value=False)
-
-      @cb_inertia.on_update
-      def _(_) -> None:
-        self.scene.show_inertia = cb_inertia.value
-        self.scene.request_update()
 
   def _setup_physics_flags(self) -> None:
     """Add checkboxes for MuJoCo disable and enable flags."""

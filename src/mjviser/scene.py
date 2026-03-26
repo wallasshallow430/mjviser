@@ -45,6 +45,7 @@ _ARROW = int(mjtGeom.mjGEOM_ARROW)
 _ARROW1 = int(mjtGeom.mjGEOM_ARROW1)
 _ARROW2 = int(mjtGeom.mjGEOM_ARROW2)
 _ARROWS = (_ARROW, _ARROW1, _ARROW2)
+_ARROW_HEAD = -1  # Synthetic geom type for arrow cone heads.
 
 _CAT_DECOR = int(mujoco.mjtCatBit.mjCAT_DECOR)
 _OBJ_TENDON = int(mujoco.mjtObj.mjOBJ_TENDON)
@@ -56,20 +57,23 @@ _UNIT_MESHES: dict[int, trimesh.Trimesh] = {}
 def _get_unit_mesh(geom_type: int) -> trimesh.Trimesh:
   """Return a cached unit mesh for the given mjvGeom type."""
   if geom_type not in _UNIT_MESHES:
-    if geom_type in (_CYLINDER, _CAPSULE):
-      # Capsules use cylinders: non-uniform scaling distorts hemispherical caps.
+    if geom_type == _CYLINDER:
       _UNIT_MESHES[geom_type] = trimesh.creation.cylinder(radius=1.0, height=1.0)
+    elif geom_type == _CAPSULE:
+      _UNIT_MESHES[geom_type] = trimesh.creation.capsule(radius=1.0, height=1.0)
     elif geom_type == _BOX:
       _UNIT_MESHES[geom_type] = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
     elif geom_type in (_ELLIPSOID, _SPHERE):
       _UNIT_MESHES[geom_type] = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
     elif geom_type in _ARROWS:
-      # Composite shaft + head along Z axis, total height = 1.
-      shaft = trimesh.creation.cylinder(radius=0.4, height=0.8, sections=12)
-      shaft.apply_translation([0, 0, 0.4])
-      head = trimesh.creation.cone(radius=1.0, height=0.2, sections=12)
-      head.apply_translation([0, 0, 0.9])
-      _UNIT_MESHES[geom_type] = trimesh.util.concatenate([shaft, head])
+      # Arrow shaft: cylinder centered at origin, height along Z.
+      shaft = trimesh.creation.cylinder(radius=1.0, height=1.0, sections=12)
+      shaft.apply_translation([0, 0, 0.5])
+      _UNIT_MESHES[geom_type] = shaft
+    elif geom_type == _ARROW_HEAD:
+      _UNIT_MESHES[geom_type] = trimesh.creation.cone(
+        radius=2.0, height=1.0, sections=12
+      )
     else:
       _UNIT_MESHES[geom_type] = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
   return _UNIT_MESHES[geom_type]
@@ -113,7 +117,7 @@ class ViserMujocoScene:
     # Handles.
     self.mesh_handles_by_group: dict[tuple[int, int, int], viser.BatchedGlbHandle] = {}
     self.site_handles_by_group: dict[tuple[int, int], viser.BatchedGlbHandle] = {}
-    self._decor_handles: dict[int, viser.BatchedMeshHandle] = {}
+    self._decor_handles: dict[tuple[int, bool], viser.BatchedMeshHandle] = {}
     self._fixed_geom_handles: dict[tuple[int, int, int], viser.GlbHandle] = {}
     self._fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = {}
 
@@ -123,9 +127,22 @@ class ViserMujocoScene:
     self.show_only_selected = False
     self.geom_groups_visible = [True, True, True, False, False, False]
     self.site_groups_visible = [True, True, True, False, False, False]
-    self.contact_point_color: tuple[int, int, int] = _DEFAULT_CONTACT_POINT_COLOR
-    self.contact_force_color: tuple[int, int, int] = _DEFAULT_CONTACT_FORCE_COLOR
     self.meansize_override: float | None = None
+
+    # Set default colors for decor elements (written to model.vis.rgba).
+    mj_model.vis.rgba.contactpoint[:] = [
+      _DEFAULT_CONTACT_POINT_COLOR[0] / 255,
+      _DEFAULT_CONTACT_POINT_COLOR[1] / 255,
+      _DEFAULT_CONTACT_POINT_COLOR[2] / 255,
+      0.8,
+    ]
+    mj_model.vis.rgba.contactforce[:] = [
+      _DEFAULT_CONTACT_FORCE_COLOR[0] / 255,
+      _DEFAULT_CONTACT_FORCE_COLOR[1] / 255,
+      _DEFAULT_CONTACT_FORCE_COLOR[2] / 255,
+      0.8,
+    ]
+    mj_model.vis.rgba.inertia[:] = [1.0, 0.7, 0.24, 0.5]
     self.needs_update = False
     self.paused = False
 
@@ -202,13 +219,9 @@ class ViserMujocoScene:
 
   def _any_decor_visible(self) -> bool:
     """Return True if any overlay visualization is enabled."""
-    return (
-      self.show_contact_points
-      or self.show_contact_forces
-      or self.show_tendons
-      or self.show_inertia
-      or self.frame_mode != "None"
-    )
+    if self.frame_mode != "None":
+      return True
+    return any(self._mjv_option.flags[i] for i in range(len(self._mjv_option.flags)))
 
   def _sync_visibilities(self) -> None:
     """Synchronize all handle visibilities based on current flags."""
@@ -228,14 +241,13 @@ class ViserMujocoScene:
       for handle in self._decor_handles.values():
         handle.visible = False
 
-  def create_visualization_gui(
+  def create_scene_gui(
     self,
     camera_distance: float = -1.0,
     camera_azimuth: float = 120.0,
     camera_elevation: float = 20.0,
   ) -> None:
-    """Add camera, environment, and contact controls into the current
-    GUI context. Call this inside a tab or folder.
+    """Add camera and environment controls into the current GUI context.
 
     Args:
         camera_distance: Default camera distance. If negative, derived
@@ -324,117 +336,183 @@ class ViserMujocoScene:
           client.camera.position = _camera_offset
           client.camera.look_at = _center
 
-    with self.server.gui.add_folder("Contacts"):
-      cb_contact_points = self.server.gui.add_checkbox(
-        "Points",
-        initial_value=False,
-      )
-      contact_point_color = self.server.gui.add_rgb(
-        "Points Color", initial_value=self.contact_point_color
-      )
-      cb_contact_forces = self.server.gui.add_checkbox(
-        "Forces",
-        initial_value=False,
-      )
-      contact_force_color = self.server.gui.add_rgb(
-        "Forces Color", initial_value=self.contact_force_color
-      )
+  def create_overlay_gui(self) -> None:
+    """Add overlay visualization controls into the current GUI context.
 
-      @cb_contact_points.on_update
-      def _(_) -> None:
-        self.show_contact_points = cb_contact_points.value
-        self._sync_visibilities()
-        self.request_update()
+    Controls are grouped by feature so that toggle, color, opacity,
+    and scale live together for each overlay type.
+    """
+    _rgba = self.mj_model.vis.rgba
+    _vis = self.mj_model.vis.scale
+    _map = self.mj_model.vis.map
+    _stat = self.mj_model.stat
+    _opt = self._mjv_option
 
-      @contact_point_color.on_update
-      def _(_) -> None:
-        self.contact_point_color = contact_point_color.value
+    def _vis_flag_cb(flag_idx: int, initial: bool = False) -> None:
+      """Add a vis-flag checkbox at the current GUI level."""
+      _opt.flags[flag_idx] = int(initial)
+      cb = self.server.gui.add_checkbox("Enabled", initial_value=initial)
+
+      @cb.on_update
+      def _(event, _idx=flag_idx) -> None:
+        _opt.flags[_idx] = int(event.target.value)
         self._clear_decor_handles()
         self.request_update()
 
-      @cb_contact_forces.on_update
-      def _(_) -> None:
-        self.show_contact_forces = cb_contact_forces.value
-        self._sync_visibilities()
-        self.request_update()
-
-      @contact_force_color.on_update
-      def _(_) -> None:
-        self.contact_force_color = contact_force_color.value
-        self._clear_decor_handles()
-        self.request_update()
-
-    if self.mj_model.ntendon > 0:
-      cb_tendons = self.server.gui.add_checkbox(
-        "Tendons",
-        initial_value=self.show_tendons,
+    def _color_controls(rgba_attr: str) -> None:
+      """Add color picker + opacity slider for a model.vis.rgba field."""
+      rgba_arr = getattr(_rgba, rgba_attr)
+      rgb_init = (
+        int(rgba_arr[0] * 255),
+        int(rgba_arr[1] * 255),
+        int(rgba_arr[2] * 255),
       )
-
-      @cb_tendons.on_update
-      def _(_) -> None:
-        self.show_tendons = cb_tendons.value
-        self._sync_visibilities()
-        self.request_update()
-
-    with self.server.gui.add_folder("Scale"):
-      _vis = self.mj_model.vis.scale
-      _stat = self.mj_model.stat
-
-      meansize_slider = self.server.gui.add_slider(
-        "Global",
-        min=_stat.meansize * 0.1,
-        max=_stat.meansize * 5.0,
-        step=_stat.meansize * 0.01,
-        initial_value=_stat.meansize,
-        hint="Global size for all decorations (model.stat.meansize).",
-      )
-      frame_len_slider = self.server.gui.add_slider(
-        "Frame length",
-        min=0.1,
-        max=5.0,
+      cp = self.server.gui.add_rgb("Color", initial_value=rgb_init)
+      op = self.server.gui.add_slider(
+        "Opacity",
+        min=0.0,
+        max=1.0,
         step=0.05,
-        initial_value=_vis.framelength,
-        hint="Coordinate frame axis length (vis.scale.framelength).",
-      )
-      frame_width_slider = self.server.gui.add_slider(
-        "Frame width",
-        min=0.01,
-        max=1.0,
-        step=0.01,
-        initial_value=_vis.framewidth,
-        hint="Coordinate frame axis width (vis.scale.framewidth).",
-      )
-      contact_slider = self.server.gui.add_slider(
-        "Contact width",
-        min=0.01,
-        max=2.0,
-        step=0.01,
-        initial_value=_vis.contactwidth,
-        hint="Contact point radius (vis.scale.contactwidth).",
-      )
-      force_slider = self.server.gui.add_slider(
-        "Force width",
-        min=0.01,
-        max=1.0,
-        step=0.01,
-        initial_value=_vis.forcewidth,
-        hint="Force arrow width (vis.scale.forcewidth).",
+        initial_value=float(rgba_arr[3]),
       )
 
-      def _on_scale_update(_) -> None:  # type: ignore[no-untyped-def]
-        _stat.meansize = meansize_slider.value
-        _vis.framelength = frame_len_slider.value
-        _vis.framewidth = frame_width_slider.value
-        _vis.contactwidth = contact_slider.value
-        _vis.forcewidth = force_slider.value
+      def _on_update(_, _a=rgba_attr, _cp=cp, _op=op) -> None:
+        arr = getattr(_rgba, _a)
+        r, g, b = _cp.value
+        arr[:] = [r / 255, g / 255, b / 255, _op.value]
         self._clear_decor_handles()
         self.request_update()
 
-      meansize_slider.on_update(_on_scale_update)
-      frame_len_slider.on_update(_on_scale_update)
-      frame_width_slider.on_update(_on_scale_update)
-      contact_slider.on_update(_on_scale_update)
-      force_slider.on_update(_on_scale_update)
+      cp.on_update(_on_update)
+      op.on_update(_on_update)
+
+    def _scale_slider(
+      label: str,
+      obj: object,
+      attr: str,
+      lo: float,
+      hi: float,
+      step: float,
+    ) -> None:
+      """Add a scale slider that writes to a model field."""
+      lo_r, hi_r = round(lo, 3), round(hi, 3)
+      val = max(lo_r, min(hi_r, round(float(getattr(obj, attr)), 3)))
+      sl = self.server.gui.add_slider(
+        label,
+        min=lo_r,
+        max=hi_r,
+        step=round(step, 3),
+        initial_value=val,
+      )
+
+      @sl.on_update
+      def _(_, _obj=obj, _attr=attr, _sl=sl) -> None:
+        setattr(_obj, _attr, _sl.value)
+        self._clear_decor_handles()
+        self.request_update()
+
+    # -- Frames -----------------------------------------------------------
+
+    frame_dropdown = self.server.gui.add_dropdown(
+      "Frames", options=["None", "Body", "Geom", "Site"]
+    )
+
+    @frame_dropdown.on_update
+    def _(_) -> None:
+      self.frame_mode = frame_dropdown.value
+      self.request_update()
+
+    _scale_slider("Frame length", _vis, "framelength", 0.1, 5.0, 0.05)
+    _scale_slider("Frame width", _vis, "framewidth", 0.01, 1.0, 0.01)
+
+    # -- Contact points ---------------------------------------------------
+
+    with self.server.gui.add_folder("Contact points"):
+      _vis_flag_cb(int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT))
+      _color_controls("contactpoint")
+      _scale_slider("Width", _vis, "contactwidth", 0.01, 2.0, 0.01)
+      _scale_slider("Height", _vis, "contactheight", 0.01, 1.0, 0.01)
+
+    # -- Contact forces ---------------------------------------------------
+
+    with self.server.gui.add_folder("Contact forces"):
+      _vis_flag_cb(int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE))
+      _color_controls("contactforce")
+      _scale_slider("Width", _vis, "forcewidth", 0.01, 1.0, 0.01)
+      _scale_slider("Force scale", _map, "force", 0.001, 0.1, 0.001)
+
+      cb_split = self.server.gui.add_checkbox(
+        "Split normal/friction", initial_value=False
+      )
+
+      @cb_split.on_update
+      def _(event) -> None:
+        _opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTSPLIT] = int(event.target.value)
+        self._clear_decor_handles()
+        self.request_update()
+
+    # -- Inertia ----------------------------------------------------------
+
+    with self.server.gui.add_folder("Inertia"):
+      _vis_flag_cb(int(mujoco.mjtVisFlag.mjVIS_INERTIA))
+
+      inertia_shape = self.server.gui.add_dropdown(
+        "Shape",
+        options=["Box", "Ellipsoid"],
+        initial_value=(
+          "Ellipsoid" if self.mj_model.vis.global_.ellipsoidinertia else "Box"
+        ),
+      )
+
+      @inertia_shape.on_update
+      def _(_) -> None:
+        self.mj_model.vis.global_.ellipsoidinertia = int(
+          inertia_shape.value == "Ellipsoid"
+        )
+        self._clear_decor_handles()
+        self.request_update()
+
+      _color_controls("inertia")
+
+    # -- Joints -----------------------------------------------------------
+
+    with self.server.gui.add_folder("Joints"):
+      _vis_flag_cb(int(mujoco.mjtVisFlag.mjVIS_JOINT))
+      _color_controls("joint")
+      _scale_slider("Length", _vis, "jointlength", 0.1, 5.0, 0.05)
+      _scale_slider("Width", _vis, "jointwidth", 0.01, 1.0, 0.01)
+
+    # -- Simple toggles ---------------------------------------------------
+
+    _tendon_flag = int(mujoco.mjtVisFlag.mjVIS_TENDON)
+    _opt.flags[_tendon_flag] = int(self.mj_model.ntendon > 0)
+    _simple_flags: list[tuple[str, int, bool]] = [
+      ("Tendons", _tendon_flag, self.mj_model.ntendon > 0),
+      ("Actuators", int(mujoco.mjtVisFlag.mjVIS_ACTUATOR), False),
+      ("COM", int(mujoco.mjtVisFlag.mjVIS_COM), False),
+      ("Constraints", int(mujoco.mjtVisFlag.mjVIS_CONSTRAINT), False),
+      ("Auto-connect", int(mujoco.mjtVisFlag.mjVIS_AUTOCONNECT), False),
+    ]
+
+    for label, flag_idx, initial in _simple_flags:
+      cb = self.server.gui.add_checkbox(label, initial_value=initial)
+
+      @cb.on_update
+      def _(event, _idx=flag_idx) -> None:
+        _opt.flags[_idx] = int(event.target.value)
+        self._clear_decor_handles()
+        self.request_update()
+
+    # -- Global scale -----------------------------------------------------
+
+    _scale_slider(
+      "Global scale",
+      _stat,
+      "meansize",
+      _stat.meansize * 0.1,
+      _stat.meansize * 5.0,
+      _stat.meansize * 0.01,
+    )
 
   def create_groups_gui(self) -> None:
     """Add geom and site group visibility checkboxes into the
@@ -466,6 +544,27 @@ class ViserMujocoScene:
           self.site_groups_visible[group_idx] = event.target.value
           self._sync_visibilities()
           self.request_update()
+
+    # mjvOption group arrays for decor elements.
+    _opt_groups: list[tuple[str, str]] = [
+      ("Joints", "jointgroup"),
+      ("Tendons", "tendongroup"),
+      ("Actuators", "actuatorgroup"),
+    ]
+    for folder_name, attr in _opt_groups:
+      group_arr = getattr(self._mjv_option, attr)
+      with self.server.gui.add_folder(folder_name):
+        for i in range(6):
+          cb = self.server.gui.add_checkbox(
+            f"{folder_name[0]}{i}",
+            initial_value=bool(group_arr[i]),
+          )
+
+          @cb.on_update
+          def _(event, _arr=group_arr, _idx=i) -> None:
+            _arr[_idx] = int(event.target.value)
+            self._clear_decor_handles()
+            self.request_update()
 
   def update_from_arrays(
     self,
@@ -835,84 +934,141 @@ class ViserMujocoScene:
       self._mjv_scene,
     )
 
-    # Group relevant geoms by type (DECOR + tendons).
-    geoms_by_type: dict[int, list[int]] = defaultdict(list)
+    # Group geoms by (type, is_tendon). Tendons are keyed separately so
+    # they get cylinder meshes (non-uniform scaling distorts capsule caps)
+    # while other capsules (e.g. auto-connect) use real capsule meshes.
+    geoms_by_key: dict[tuple[int, bool], list[int]] = defaultdict(list)
     for i in range(self._mjv_scene.ngeom):
       g = self._mjv_scene.geoms[i]
-      if int(g.category) == _CAT_DECOR or int(g.objtype) == _OBJ_TENDON:
-        geoms_by_type[int(g.type)].append(i)
+      is_tendon = int(g.objtype) == _OBJ_TENDON
+      if int(g.category) == _CAT_DECOR or is_tendon:
+        geoms_by_key[(int(g.type), is_tendon)].append(i)
 
-    active_keys: set[int] = set()
+    active_keys: set[tuple[int, bool]] = set()
 
-    for geom_type, indices in geoms_by_type.items():
+    for (geom_type, is_tendon), indices in geoms_by_key.items():
       n = len(indices)
-      active_keys.add(geom_type)
+      active_keys.add((geom_type, is_tendon))
 
       positions = np.empty((n, 3), dtype=np.float32)
       orientations = np.empty((n, 4), dtype=np.float32)
       scales = np.empty((n, 3), dtype=np.float32)
       colors = np.empty((n, 3), dtype=np.uint8)
+      opacities = np.empty(n, dtype=np.float32)
+
+      # For arrows, collect head data separately.
+      head_positions: list[np.ndarray] = []
+      head_orientations: list[np.ndarray] = []
+      head_scales: list[np.ndarray] = []
+      head_colors: list[np.ndarray] = []
+      head_opacities: list[float] = []
 
       for j, gi in enumerate(indices):
         g = self._mjv_scene.geoms[gi]
-        positions[j] = np.array(g.pos) + scene_offset
-        orientations[j] = vtf.SO3.from_matrix(np.array(g.mat).reshape(3, 3)).wxyz
+        pos = np.array(g.pos) + scene_offset
+        mat = np.array(g.mat).reshape(3, 3)
+        quat = vtf.SO3.from_matrix(mat).wxyz
         size = np.array(g.size)
+        rgba = np.array(g.rgba)
+
+        positions[j] = pos
+        orientations[j] = quat
+        colors[j] = (np.clip(rgba[:3], 0, 1) * 255).astype(np.uint8)
+        opacities[j] = float(rgba[3])
 
         # Map mjvGeom size to unit-mesh scale.
         if geom_type in (_CYLINDER, _CAPSULE):
-          scales[j] = [size[0], size[0], size[2] * 2]
+          # Zero-length capsule = sphere (COM dot in auto-connect).
+          height = max(size[2] * 2, size[0])
+          scales[j] = [size[0], size[0], height]
         elif geom_type in _ARROWS:
-          scales[j] = [size[0], size[0], size[2]]
+          # size = [shaft_radius, head_radius, total_length]
+          # 80% shaft, 20% head (matches mjlab convention).
+          total_len = size[2]
+          shaft_len = total_len * 0.8
+          head_len = total_len * 0.2
+          w = size[0]
+          scales[j] = [w, w, shaft_len]
+          # Head: cone at the tip of the shaft.
+          tip_offset = mat[:, 2] * shaft_len
+          head_positions.append(pos + tip_offset.astype(np.float32))
+          head_orientations.append(quat)
+          head_scales.append(np.array([w, w, head_len], dtype=np.float32))
+          head_colors.append(colors[j].copy())
+          head_opacities.append(opacities[j])
         else:
           scales[j] = size
 
-        # Color: use user overrides for contacts/forces, MuJoCo defaults otherwise.
-        rgba = np.array(g.rgba)
-        color = (np.clip(rgba[:3], 0, 1) * 255).astype(np.uint8)
-        if int(g.category) == _CAT_DECOR:
-          if geom_type in _ARROWS:
-            color = np.array(self.contact_force_color, dtype=np.uint8)
-          elif geom_type in (_CYLINDER, _CAPSULE) and self.show_contact_points:
-            # DECOR cylinders with pure R/G/B are frame axes, not contacts.
-            r, gc_, b = rgba[0], rgba[1], rgba[2]
-            is_axis = (
-              (r > 0.8 and gc_ < 0.1 and b < 0.1)
-              or (r < 0.1 and gc_ > 0.8 and b < 0.1)
-              or (r < 0.1 and gc_ < 0.1 and b > 0.8)
-            )
-            if not is_axis:
-              color = np.array(self.contact_point_color, dtype=np.uint8)
-        colors[j] = color
+      # Tendons use cylinders; other capsules use real capsule meshes.
+      mesh_type = _CYLINDER if is_tendon else geom_type
+      key = (geom_type, is_tendon)
 
-      # Create or update batched handle.
-      handle = self._decor_handles.get(geom_type)
+      handle = self._decor_handles.get(key)
       if handle is not None and n != len(handle.batched_positions):
         handle.remove()
         handle = None
-        del self._decor_handles[geom_type]
+        del self._decor_handles[key]
 
       if handle is None:
-        unit = _get_unit_mesh(geom_type)
+        unit = _get_unit_mesh(mesh_type)
         handle = self.server.scene.add_batched_meshes_simple(
-          f"/decor/{geom_type}",
+          f"/decor/{geom_type}_{is_tendon}",
           unit.vertices,
           unit.faces,
           batched_wxyzs=orientations,
           batched_positions=positions,
           batched_scales=scales,
           batched_colors=colors,
-          opacity=0.8,
+          batched_opacities=opacities,
           lod="off",
           cast_shadow=False,
           receive_shadow=False,
         )
-        self._decor_handles[geom_type] = handle
+        self._decor_handles[key] = handle
       else:
         handle.batched_positions = positions
         handle.batched_wxyzs = orientations
         handle.batched_scales = scales
         handle.visible = True
+
+      # Create arrow heads as a separate handle.
+      if head_positions:
+        head_key = (_ARROW_HEAD, is_tendon)
+        active_keys.add(head_key)
+        h_pos = np.array(head_positions)
+        h_ori = np.array(head_orientations)
+        h_scl = np.array(head_scales)
+        h_col = np.array(head_colors)
+        h_opa = np.array(head_opacities, dtype=np.float32)
+        nh = len(head_positions)
+
+        h_handle = self._decor_handles.get(head_key)
+        if h_handle is not None and nh != len(h_handle.batched_positions):
+          h_handle.remove()
+          h_handle = None
+          del self._decor_handles[head_key]
+
+        if h_handle is None:
+          unit = _get_unit_mesh(_ARROW_HEAD)
+          h_handle = self.server.scene.add_batched_meshes_simple(
+            "/decor/arrow_heads",
+            unit.vertices,
+            unit.faces,
+            batched_wxyzs=h_ori,
+            batched_positions=h_pos,
+            batched_scales=h_scl,
+            batched_colors=h_col,
+            batched_opacities=h_opa,
+            lod="off",
+            cast_shadow=False,
+            receive_shadow=False,
+          )
+          self._decor_handles[head_key] = h_handle
+        else:
+          h_handle.batched_positions = h_pos
+          h_handle.batched_wxyzs = h_ori
+          h_handle.batched_scales = h_scl
+          h_handle.visible = True
 
     # Hide handles for types not present this frame.
     for key, handle in self._decor_handles.items():
