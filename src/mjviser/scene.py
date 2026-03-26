@@ -78,6 +78,7 @@ class ViserMujocoScene:
     self.contact_point_handle: viser.BatchedMeshHandle | None = None
     self.contact_force_shaft_handle: viser.BatchedMeshHandle | None = None
     self.contact_force_head_handle: viser.BatchedMeshHandle | None = None
+    self._tendon_handle: viser.BatchedMeshHandle | None = None
     self._fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = {}
 
     # Visualization settings.
@@ -88,6 +89,7 @@ class ViserMujocoScene:
     self.site_groups_visible = [True, True, True, False, False, False]
     self.show_contact_points = False
     self.show_contact_forces = False
+    self.show_tendons = mj_model.ntendon > 0
     self.contact_point_color: tuple[int, int, int] = _DEFAULT_CONTACT_POINT_COLOR
     self.contact_force_color: tuple[int, int, int] = _DEFAULT_CONTACT_FORCE_COLOR
     self.meansize_override: float | None = None
@@ -142,6 +144,9 @@ class ViserMujocoScene:
         self.contact_force_shaft_handle.visible = False
       if self.contact_force_head_handle is not None:
         self.contact_force_head_handle.visible = False
+
+    if self._tendon_handle is not None and not self.show_tendons:
+      self._tendon_handle.visible = False
 
   def create_visualization_gui(
     self,
@@ -296,6 +301,18 @@ class ViserMujocoScene:
         self.meansize_override = meansize_input.value
         self._request_update()
 
+    if self.mj_model.ntendon > 0:
+      cb_tendons = self.server.gui.add_checkbox(
+        "Tendons",
+        initial_value=self.show_tendons,
+      )
+
+      @cb_tendons.on_update
+      def _(_) -> None:
+        self.show_tendons = cb_tendons.value
+        self._sync_visibilities()
+        self._request_update()
+
   def create_groups_gui(self) -> None:
     """Add geom and site group visibility checkboxes into the
     current GUI context."""
@@ -350,9 +367,11 @@ class ViserMujocoScene:
             ``(num_envs, nmocap, 4)``.
         env_idx: Environment index to visualize. If None, uses
             ``self.env_idx``.
-        qpos: Joint positions for contact computation.
-        qvel: Joint velocities for contact computation.
-        ctrl: Controls for contact computation.
+        qpos: Joint positions. Required for contact and tendon
+            visualization in the selected environment.
+        qvel: Joint velocities. Required for contact and tendon
+            visualization in the selected environment.
+        ctrl: Controls for the selected environment.
     """
     if env_idx is None:
       env_idx = self.env_idx
@@ -370,17 +389,21 @@ class ViserMujocoScene:
       scene_offset = -tracked_pos
 
     contacts = None
-    if self.show_contact_points or self.show_contact_forces:
-      if qpos is not None and qvel is not None:
-        self.mj_data.qpos[:] = qpos[env_idx]
-        self.mj_data.qvel[:] = qvel[env_idx]
-        if ctrl is not None and self.mj_model.nu > 0:
-          self.mj_data.ctrl[:] = ctrl[env_idx]
-        if self.mj_model.nmocap > 0:
-          self.mj_data.mocap_pos[:] = mocap_pos[env_idx]
-          self.mj_data.mocap_quat[:] = mocap_quat[env_idx]
-        mujoco.mj_forward(self.mj_model, self.mj_data)
-        contacts = self._extract_contacts_from_mjdata(self.mj_data)
+    replay_data = None
+    needs_forward = (
+      self.show_contact_points or self.show_contact_forces or self.show_tendons
+    )
+    if needs_forward and qpos is not None and qvel is not None:
+      self.mj_data.qpos[:] = qpos[env_idx]
+      self.mj_data.qvel[:] = qvel[env_idx]
+      if ctrl is not None and self.mj_model.nu > 0:
+        self.mj_data.ctrl[:] = ctrl[env_idx]
+      if self.mj_model.nmocap > 0:
+        self.mj_data.mocap_pos[:] = mocap_pos[env_idx]
+        self.mj_data.mocap_quat[:] = mocap_quat[env_idx]
+      mujoco.mj_forward(self.mj_model, self.mj_data)
+      contacts = self._extract_contacts_from_mjdata(self.mj_data)
+      replay_data = self.mj_data
 
     self._update_visualization(
       body_xpos,
@@ -390,6 +413,7 @@ class ViserMujocoScene:
       env_idx,
       scene_offset,
       contacts,
+      replay_data,
     )
 
   def update_from_mjdata(self, mj_data: mujoco.MjData) -> None:
@@ -422,6 +446,7 @@ class ViserMujocoScene:
       env_idx,
       scene_offset,
       contacts,
+      mj_data,
     )
 
   def _update_visualization(
@@ -433,6 +458,7 @@ class ViserMujocoScene:
     env_idx: int,
     scene_offset: np.ndarray,
     contacts: list[_Contact] | None,
+    mj_data: mujoco.MjData | None = None,
   ) -> None:
     """Shared visualization update logic."""
     self._last_body_xpos = body_xpos
@@ -474,6 +500,11 @@ class ViserMujocoScene:
 
       if contacts is not None:
         self._update_contact_visualization(contacts, scene_offset)
+
+      if mj_data is not None and self.show_tendons:
+        self._update_tendon_visualization(mj_data, scene_offset)
+      elif self._tendon_handle is not None and not self.show_tendons:
+        self._tendon_handle.visible = False
 
       self.server.flush()
 
@@ -852,3 +883,91 @@ class ViserMujocoScene:
       self.contact_force_shaft_handle.visible = (
         self.contact_force_head_handle.visible
       ) = False
+
+  def _update_tendon_visualization(
+    self, mj_data: mujoco.MjData, scene_offset: np.ndarray
+  ) -> None:
+    """Render spatial tendons as batched cylinders."""
+    m = self.mj_model
+    z_up = np.array([0.0, 0.0, 1.0])
+
+    # wrap_xpos is (nwrap, 6) but the C engine indexes it as a flat
+    # float array with stride 3: point j is at wrap_xpos_flat[3*j:3*j+3].
+    # wrap_obj is (nwrap, 2), same flat layout.
+    xpos_flat = mj_data.wrap_xpos.ravel()
+    obj_flat = mj_data.wrap_obj.ravel()
+
+    positions: list[np.ndarray] = []
+    orientations: list[np.ndarray] = []
+    scales: list[np.ndarray] = []
+    colors: list[np.ndarray] = []
+
+    for i in range(m.ntendon):
+      adr = mj_data.ten_wrapadr[i]
+      num = mj_data.ten_wrapnum[i]
+      if num < 2:
+        continue
+
+      width = float(m.tendon_width[i])
+      rgba = m.tendon_rgba[i]
+      color = (np.clip(rgba[:3], 0, 1) * 255).astype(np.uint8)
+
+      for j in range(adr, adr + num - 1):
+        # Skip pulley markers.
+        if obj_flat[j] == -2 or obj_flat[j + 1] == -2:
+          continue
+
+        p0 = xpos_flat[3 * j : 3 * j + 3]
+        p1 = xpos_flat[3 * (j + 1) : 3 * (j + 1) + 3]
+        diff = p1 - p0
+        length = float(np.linalg.norm(diff))
+        if length < 1e-8:
+          continue
+
+        direction = diff / length
+        midpoint = (p0 + p1) / 2 + scene_offset
+
+        # Half width for segments wrapping around geoms.
+        w = 0.5 * width if obj_flat[j] >= 0 and obj_flat[j + 1] >= 0 else width
+
+        quat = vtf.SO3.from_matrix(rotation_matrix_from_vectors(z_up, direction)).wxyz
+
+        positions.append(midpoint.astype(np.float32))
+        orientations.append(quat.astype(np.float32))
+        scales.append(np.array([w, w, length], dtype=np.float32))
+        colors.append(color)
+
+    if positions:
+      pos_arr = np.array(positions)
+      ori_arr = np.array(orientations)
+      scl_arr = np.array(scales)
+      col_arr = np.array(colors)
+      n = len(positions)
+
+      # Recreate handle when segment count changes.
+      if self._tendon_handle is not None and n != len(
+        self._tendon_handle.batched_positions
+      ):
+        self._tendon_handle.remove()
+        self._tendon_handle = None
+
+      if self._tendon_handle is None:
+        cyl = trimesh.creation.cylinder(radius=1.0, height=1.0)
+        self._tendon_handle = self.server.scene.add_batched_meshes_simple(
+          "/tendons",
+          cyl.vertices,
+          cyl.faces,
+          batched_wxyzs=ori_arr,
+          batched_positions=pos_arr,
+          batched_scales=scl_arr,
+          batched_colors=col_arr,
+          cast_shadow=False,
+          receive_shadow=False,
+        )
+      else:
+        self._tendon_handle.batched_positions = pos_arr
+        self._tendon_handle.batched_wxyzs = ori_arr
+        self._tendon_handle.batched_scales = scl_arr
+        self._tendon_handle.visible = True
+    elif self._tendon_handle is not None:
+      self._tendon_handle.visible = False
