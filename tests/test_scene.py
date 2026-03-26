@@ -100,28 +100,43 @@ def test_update_from_mjdata_scene_offset(scene, simple_model):
   assert np.linalg.norm(scene._scene_offset) > 0
 
 
-# Contact extraction--------------------------------------------------
+# Overlay properties -------------------------------------------------
 
 
-def test_extract_contacts_no_contacts(scene, simple_model):
-  data = mujoco.MjData(simple_model)
-  # Body is in the air at default position, no contacts.
-  data.qpos[:3] = [0, 0, 5.0]
-  mujoco.mj_forward(simple_model, data)
-  contacts = scene._extract_contacts_from_mjdata(data)
-  assert len(contacts) == 0
+def test_show_contact_points_property(scene):
+  assert scene.show_contact_points is False
+  scene.show_contact_points = True
+  assert scene.show_contact_points is True
+  assert bool(scene._mjv_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT])
 
 
-def test_extract_contacts_with_contacts(scene, simple_model):
-  data = mujoco.MjData(simple_model)
-  # Drop the box onto the plane.
-  data.qpos[:3] = [0, 0, 0.1]
-  mujoco.mj_forward(simple_model, data)
-  contacts = scene._extract_contacts_from_mjdata(data)
-  if len(contacts) == 0:
-    # Some models may not generate contacts at this position.
-    return
-  c = contacts[0]
-  assert c.pos.shape == (3,)
-  assert c.frame.shape == (3, 3)
-  assert c.force.shape == (3,)
+def test_show_contact_forces_property(scene):
+  assert scene.show_contact_forces is False
+  scene.show_contact_forces = True
+  assert scene.show_contact_forces is True
+  assert bool(scene._mjv_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE])
+
+
+def test_show_inertia_property(scene):
+  assert scene.show_inertia is False
+  scene.show_inertia = True
+  assert scene.show_inertia is True
+  assert bool(scene._mjv_option.flags[mujoco.mjtVisFlag.mjVIS_INERTIA])
+
+
+def test_frame_mode_property(scene):
+  assert scene.frame_mode == "None"
+  scene.frame_mode = "Body"
+  assert scene.frame_mode == "Body"
+  assert scene._mjv_option.frame == int(mujoco.mjtFrame.mjFRAME_BODY)
+  scene.frame_mode = "None"
+  assert scene._mjv_option.frame == int(mujoco.mjtFrame.mjFRAME_NONE)
+
+
+def test_any_decor_visible(scene):
+  assert scene._any_decor_visible() is False
+  scene.show_contact_points = True
+  assert scene._any_decor_visible() is True
+  scene.show_contact_points = False
+  scene.frame_mode = "Geom"
+  assert scene._any_decor_visible() is True
