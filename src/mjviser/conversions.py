@@ -10,6 +10,85 @@ from mujoco import mj_id2name, mjtGeom, mjtObj
 from PIL import Image
 
 
+def _cubemap_vertex_colors(
+  mj_model: mujoco.MjModel,
+  matid: int,
+  vertices: np.ndarray,
+  faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+  """Assign per-vertex colors by projecting a cube map texture.
+
+  Computes each triangle's normal, maps it to the nearest cube map
+  face, and assigns that face's average color. If the nearest face
+  is empty (black), falls back to the nearest non-empty face. This
+  handles chamfered edges that point between cube faces.
+
+  Returns RGBA uint8 per vertex, or None if the material has no
+  cube map texture.
+  """
+  texid = int(mj_model.mat_texid[matid, int(mujoco.mjtTextureRole.mjTEXROLE_RGB)])
+  if texid < 0:
+    texid = int(mj_model.mat_texid[matid, int(mujoco.mjtTextureRole.mjTEXROLE_RGBA)])
+  if texid < 0:
+    return None
+
+  w = mj_model.tex_width[texid]
+  h = mj_model.tex_height[texid]
+  nc = mj_model.tex_nchannel[texid]
+  if int(mj_model.tex_type[texid]) != 1 or h != w * 6:
+    return None
+
+  adr = mj_model.tex_adr[texid]
+  data = mj_model.tex_data[adr : adr + w * h * nc].reshape(6, w, w, nc)
+
+  # Average color per cube face. Empty faces stay at [0,0,0,0].
+  face_colors = np.zeros((6, 4), dtype=np.uint8)
+  has_color = np.zeros(6, dtype=bool)
+  for i in range(6):
+    mask = data[i, :, :, : min(nc, 3)].sum(axis=2) > 0
+    if mask.any():
+      avg = data[i][mask].mean(axis=0).astype(np.uint8)
+      face_colors[i, :nc] = avg[:nc]
+      if nc < 4:
+        face_colors[i, 3] = 255
+      has_color[i] = True
+
+  if not has_color.any():
+    return None
+
+  # Cube map axes: +X, -X, +Y, -Y, +Z, -Z.
+  axes = np.array(
+    [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+    dtype=np.float64,
+  )
+
+  # Per-triangle normals.
+  v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+  normals = np.cross(v1 - v0, v2 - v0)
+  normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-10)
+
+  # Dot products with cube axes, sorted by alignment.
+  dots = normals @ axes.T  # (nfaces, 6)
+
+  # For each triangle, pick the best cube face that has color.
+  # Sort faces by descending dot product so we try the best
+  # alignment first and skip empty faces.
+  ranked = np.argsort(-dots, axis=1)  # (nfaces, 6)
+  tri_colors = np.zeros((len(faces), 4), dtype=np.uint8)
+  for fi in range(len(faces)):
+    for ci in ranked[fi]:
+      if has_color[ci]:
+        tri_colors[fi] = face_colors[ci]
+        break
+
+  # Duplicate vertices so each triangle gets its own color.
+  new_verts = vertices[faces.ravel()]  # (nfaces*3, 3)
+  new_faces = np.arange(len(faces) * 3).reshape(-1, 3)
+  vert_colors = np.repeat(tri_colors, 3, axis=0)  # (nfaces*3, 4)
+
+  return new_verts, new_faces, vert_colors
+
+
 def mujoco_mesh_to_trimesh(
   mj_model: mujoco.MjModel, geom_idx: int, verbose: bool = False
 ) -> trimesh.Trimesh:
@@ -220,28 +299,25 @@ def mujoco_mesh_to_trimesh(
     # (process=False to avoid vertex removal).
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    # Apply material color if available.
+    # Try cube map projection, then fall back to material/geom color.
     matid = mj_model.geom_matid[geom_idx]
-
+    cubemap_result = None
     if matid >= 0 and matid < mj_model.nmat:
-      rgba = mj_model.mat_rgba[matid]
-      rgba_255 = (rgba * 255).astype(np.uint8)
-      # Use actual vertex count after mesh creation.
-      mesh.visual = trimesh.visual.ColorVisuals(
-        vertex_colors=np.tile(rgba_255, (len(mesh.vertices), 1))
-      )
-      if verbose:
-        print(f"Applied material color: {rgba}")
+      cubemap_result = _cubemap_vertex_colors(mj_model, matid, vertices, faces)
+
+    if cubemap_result is not None:
+      new_verts, new_faces, vert_colors = cubemap_result
+      mesh = trimesh.Trimesh(vertices=new_verts, faces=new_faces, process=False)
+      mesh.visual = trimesh.visual.ColorVisuals(vertex_colors=vert_colors)
     else:
-      # No material - use geom_rgba directly.
-      rgba = mj_model.geom_rgba[geom_idx]
+      if matid >= 0 and matid < mj_model.nmat:
+        rgba = mj_model.mat_rgba[matid]
+      else:
+        rgba = mj_model.geom_rgba[geom_idx]
       rgba_255 = (rgba * 255).astype(np.uint8)
-      # Use actual vertex count after mesh creation.
       mesh.visual = trimesh.visual.ColorVisuals(
         vertex_colors=np.tile(rgba_255, (len(mesh.vertices), 1))
       )
-      if verbose:
-        print(f"No material, using geom_rgba: {rgba}")
 
   # Final sanity checks.
   assert mesh.vertices.shape[1] == 3, (
@@ -272,14 +348,12 @@ def create_primitive_mesh(mj_model: mujoco.MjModel, geom_id: int) -> trimesh.Tri
   size = mj_model.geom_size[geom_id]
   geom_type = mj_model.geom_type[geom_id]
 
-  # Prefer material color over geom_rgba (geom_rgba is often the default gray).
+  # Prefer material color over geom_rgba.
   matid = mj_model.geom_matid[geom_id]
   if matid >= 0:
     rgba = mj_model.mat_rgba[matid].copy()
   else:
     rgba = mj_model.geom_rgba[geom_id].copy()
-
-  # Convert rgba to uint8 for vertex colors.
   rgba_uint8 = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
 
   if geom_type == mjtGeom.mjGEOM_SPHERE:

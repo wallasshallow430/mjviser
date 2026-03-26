@@ -350,12 +350,13 @@ class Viewer:
     with self._server.gui.add_folder("Joints"):
       for jnt_id, name, lo, hi in joints:
         qpos_adr = int(self.model.jnt_qposadr[jnt_id])
+        val = float(np.clip(self.data.qpos[qpos_adr], lo, hi))
         slider = self._server.gui.add_slider(
           name,
           min=lo,
           max=hi,
           step=round((hi - lo) / 200, 4),
-          initial_value=round(float(self.data.qpos[qpos_adr]), 3),
+          initial_value=round(val, 3),
           disabled=not self._paused,
         )
         self._joint_sliders.append(slider)
@@ -387,12 +388,13 @@ class Viewer:
 
     with self._server.gui.add_folder("Actuators"):
       for act_id, name, lo, hi in actuators:
+        val = float(np.clip(self.data.ctrl[act_id], lo, hi))
         slider = self._server.gui.add_slider(
           name,
           min=lo,
           max=hi,
           step=round((hi - lo) / 200, 4),
-          initial_value=round(float(self.data.ctrl[act_id]), 3),
+          initial_value=round(val, 3),
         )
 
         def _on_update(_, _id=act_id, _sl=slider) -> None:
