@@ -25,6 +25,9 @@ If [robot_descriptions](https://github.com/robot-descriptions/robot_descriptions
 uvx --with robot_descriptions mjviser go1
 ```
 
+> [!NOTE]
+> `uvx` defaults to the system Python and may not respect `requires-python` constraints ([astral-sh/uv#8206](https://github.com/astral-sh/uv/issues/8206)). If your system Python is 3.14+, where MuJoCo can't build yet, pass `-p 3.13` explicitly: `uvx -p 3.13 mjviser path/to/model.xml`.
+
 ## Python API
 
 ```python
@@ -69,6 +72,10 @@ while True:
 - `multi_env.py`: 4 humanoids in parallel via mujoco-warp
 - `ghost_overlay.py`: custom `render_fn` that overlays a time-delayed ghost
 - `motion_playback.py`: recorded trajectory with timeline scrubber, speed control, and contact replay
+
+## Acknowledgments
+
+Thanks to [Matija Kecman](https://github.com/okmatija) for early feedback and suggestions.
 
 ## Limitations
 
