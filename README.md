@@ -1,5 +1,9 @@
 # mjviser
 
+[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/mujocolab/mjviser/ci.yml?branch=main)](https://github.com/mujocolab/mjviser/actions/workflows/ci.yml?query=branch%3Amain)
+[![License](https://img.shields.io/github/license/mujocolab/mjviser)](https://github.com/mujocolab/mjviser/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/mjviser)](https://pypi.org/project/mjviser/)
+
 A web-based MuJoCo viewer built on [Viser](https://github.com/viser-project/viser).
 
 ## Quick start
