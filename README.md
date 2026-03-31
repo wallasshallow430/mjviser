@@ -23,6 +23,12 @@ mjviser humanoid        # finds **/humanoid*.xml
 mjviser shadow_hand     # finds **/shadow_hand*.xml
 ```
 
+Use `--port` to bind to a specific port (default: 8080):
+
+```bash
+mjviser model.xml --port 7070
+```
+
 If [robot_descriptions](https://github.com/robot-descriptions/robot_descriptions.py) is available, you can load any of its 57 MuJoCo models by name:
 
 ```bash
