@@ -168,6 +168,17 @@ class ViserMujocoScene:
       0.8,
     ]
     mj_model.vis.rgba.inertia[:] = [1.0, 0.7, 0.24, 0.5]
+
+    # Scale MuJoCo's overlay defaults proportionally so author-specified
+    # values are preserved rather than replaced outright.
+    mj_model.vis.scale.framewidth *= 0.3
+    mj_model.vis.scale.jointwidth *= 0.3
+    mj_model.vis.scale.actuatorlength *= 1.4
+    mj_model.vis.scale.actuatorwidth *= 0.15
+    mj_model.vis.scale.contactwidth *= 0.5
+    mj_model.vis.scale.contactheight *= 0.5
+    mj_model.vis.scale.forcewidth *= 0.5
+
     self.needs_update = False
     self.paused = False
 
