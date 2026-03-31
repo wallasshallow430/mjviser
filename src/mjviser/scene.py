@@ -427,23 +427,16 @@ class ViserMujocoScene:
     _stat = self.mj_model.stat
     _opt = self._mjv_option
 
-    def _vis_flag_cb(
-      flag_idx: int,
-      initial: bool = False,
-      extra_on_update: Callable[[], None] | None = None,
-    ) -> None:
+    def _vis_flag_cb(flag_idx: int, initial: bool = False) -> None:
       """Add a vis-flag checkbox at the current GUI level."""
       _opt.flags[flag_idx] = int(initial)
       cb = self.server.gui.add_checkbox("Enabled", initial_value=initial)
 
       @cb.on_update
       def _(event, _idx=flag_idx) -> None:
-        def _mutate() -> None:
-          _opt.flags[_idx] = int(event.target.value)
-          if extra_on_update is not None:
-            extra_on_update()
-
-        self._apply_visualization_change(_mutate)
+        self._apply_visualization_change(
+          lambda: _opt.flags.__setitem__(_idx, int(event.target.value))
+        )
 
     def _color_controls(rgba_attr: str) -> None:
       """Add color picker + opacity slider for a model.vis.rgba field."""
@@ -1260,13 +1253,6 @@ class ViserMujocoScene:
     for handle, _ in self._hull_dynamic_handles:
       handle.remove()
     self._hull_dynamic_handles.clear()
-
-  def _clear_decor_handles(self) -> None:
-    """Remove all decor handles and clear the cache."""
-    handles = list(self._decor_handles.values())
-    self._decor_handles.clear()
-    for handle in handles:
-      handle.remove()
 
   def _hide_all_decor(self) -> None:
     """Hide all decor handles without removing them."""
