@@ -138,9 +138,9 @@ class ViserMujocoScene:
     self._hull_fixed_handles: dict[int, viser.BatchedMeshHandle] = {}
     self._hull_dynamic_handles: list[tuple[viser.BatchedMeshHandle, int]] = []
     self._hull_color: tuple[int, int, int] = (230, 230, 255)
-    self._hull_opacity = 0.5
-    self._show_convex_hull = False
-    self._hull_hide_meshes = False
+    self._hull_opacity: float = 0.5
+    self._show_convex_hull: bool = False
+    self._hull_hide_meshes: bool = False
 
     # Visualization settings.
     self.env_idx = 0
@@ -1115,7 +1115,10 @@ class ViserMujocoScene:
     """Build fixed and dynamic handles for precomputed body hulls."""
     color = np.array(self._hull_color, dtype=np.uint8)
     opacity = np.float32(self._hull_opacity)
-    batched_opacities = None if opacity >= 1.0 else np.array([opacity])
+    fixed_opacities = None if opacity >= 1.0 else np.array([opacity], dtype=np.float32)
+    dynamic_opacities = (
+      None if opacity >= 1.0 else np.full(self.num_envs, opacity, dtype=np.float32)
+    )
 
     for body_id, (vertices, faces) in self._hull_body_meshes.items():
       if is_fixed_body(self.mj_model, body_id):
@@ -1127,7 +1130,7 @@ class ViserMujocoScene:
           batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
           batched_positions=np.zeros((1, 3), dtype=np.float32),
           batched_colors=color[None],
-          batched_opacities=batched_opacities,
+          batched_opacities=fixed_opacities,
           position=body.pos,
           wxyz=body.quat,
           visible=self._show_convex_hull,
@@ -1147,9 +1150,7 @@ class ViserMujocoScene:
         ),
         batched_positions=np.zeros((self.num_envs, 3), dtype=np.float32),
         batched_colors=np.tile(color, (self.num_envs, 1)),
-        batched_opacities=(
-          None if opacity >= 1.0 else np.full(self.num_envs, opacity, dtype=np.float32)
-        ),
+        batched_opacities=dynamic_opacities,
         visible=self._show_convex_hull,
         cast_shadow=False,
         receive_shadow=False,
