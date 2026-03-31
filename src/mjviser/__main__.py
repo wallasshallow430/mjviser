@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import mujoco
+import viser
 
 from mjviser import Viewer
 
@@ -107,12 +108,19 @@ def main() -> None:
     metavar="MODEL",
     help="path, robot_descriptions name, or search pattern for a .xml model",
   )
+  parser.add_argument(
+    "--port",
+    type=int,
+    default=8080,
+    help="port to bind the Viser server to (default: 8080)",
+  )
   args = parser.parse_args()
 
   path = _resolve_path(args.model)
   model = mujoco.MjModel.from_xml_path(str(path))
   data = mujoco.MjData(model)
-  Viewer(model, data).run()
+  server = viser.ViserServer(port=args.port)
+  Viewer(model, data, server=server).run()
 
 
 if __name__ == "__main__":

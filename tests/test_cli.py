@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import mjviser.__main__ as cli
 from mjviser.__main__ import _resolve_path
 
 
@@ -78,3 +81,30 @@ def test_directory_path_searches_inside(
   """Passing a directory path should find XMLs inside it."""
   result = _resolve_path(str(model_tree / "a" / "humanoid"))
   assert result.name == "humanoid.xml"
+
+
+def test_main_passes_port_to_server(monkeypatch: pytest.MonkeyPatch) -> None:
+  received: dict[str, object] = {}
+
+  monkeypatch.setattr(sys, "argv", ["mjviser", "robot.xml", "--port", "9123"])
+  monkeypatch.setattr(cli, "_resolve_path", lambda _: Path("robot.xml"))
+  monkeypatch.setattr(
+    cli,
+    "mujoco",
+    SimpleNamespace(
+      MjModel=SimpleNamespace(from_xml_path=lambda _: object()),
+      MjData=lambda model: object(),
+    ),
+  )
+  monkeypatch.setattr(
+    cli,
+    "viser",
+    SimpleNamespace(
+      ViserServer=lambda port: received.update(port=port) or SimpleNamespace()
+    ),
+  )
+  monkeypatch.setattr(cli, "Viewer", lambda *a, **kw: SimpleNamespace(run=lambda: None))
+
+  cli.main()
+
+  assert received["port"] == 9123
